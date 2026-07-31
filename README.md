@@ -1,4 +1,5 @@
 # LinScan-536
+<img width="1603" height="847" alt="Screenshot_2026-07-31_19-35-12" src="https://github.com/user-attachments/assets/4b164261-4375-4808-95c8-5b62a4b1a78c" />
 
 A high-performance, lightweight Linux virtual control dashboard and RTSP audio recording suite for the **Uniden BCD536HP** radio scanner.
 
