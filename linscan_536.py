@@ -323,6 +323,7 @@ class VirtualScanner(tk.Tk):
         self.knob.bind("<Button-1>", knob_click)
 
         keypad_layout = [
+            [("RANGE", 'R'), ("CLOSE CALL", 'Q')],
             [("MENU", 'M'), ("REPLAY", 'Y')],
             [("1", '1'), ("2", '2'), ("3", '3')],
             [("4", '4'), ("5", '5'), ("6", '6')],
