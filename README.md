@@ -28,7 +28,9 @@ A high-performance, lightweight Linux virtual control dashboard and RTSP audio r
 To install LinScan-536 on Debian, Ubuntu, BunsenLabs, or any Debian-based Linux distribution:
 
 git clone https://github.com/UPMI-Scanner/LinScan-536.git
+
 cd LinScan-536
+
 ./install.sh
 
 ---
