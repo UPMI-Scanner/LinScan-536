@@ -198,7 +198,6 @@ class VirtualScanner(tk.Tk):
         self.log_dept = ScrollCatcher()
         self.log_chan = ScrollCatcher()
         
-        # Tracking dictionaries for grid statistics
         self.tg_hits = {}
         self.call_times = {}
         self.current_call_start = None
@@ -438,7 +437,14 @@ class VirtualScanner(tk.Tk):
                         self.serial_buffer = b""
                         self.status_label.config(text=f"CONNECTED ({os.path.basename(p)})", fg="#39FF14")
                         self._last_status = "CONNECTED"
+                        
+                        # --- NEW: Auto-Sync Scanner Time to Computer Time ---
+                        now = datetime.datetime.now()
+                        dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
+                        time_cmd = f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r"
+                        
                         self.ser.write(b'VOL\rSQL\r')
+                        self.ser.write(time_cmd.encode('ascii'))
                         break
                     except Exception: pass
         self.after(2000, self.poll_connection)
@@ -509,7 +515,6 @@ class VirtualScanner(tk.Tk):
                 if chan_final and not any(x in chan_upper for x in ("SCAN", "ID SEARCH", "SEARCHING")):
                     tg_key = self.current_tgid or chan_final
                     
-                    # Track elapsed time for this transmission
                     if self.current_call_start is not None:
                         elapsed = time.time() - self.current_call_start
                         self.call_times[tg_key] = self.call_times.get(tg_key, 0.0) + elapsed
@@ -517,7 +522,6 @@ class VirtualScanner(tk.Tk):
 
                     self.tg_hits[tg_key] = self.tg_hits.get(tg_key, 0) + 1
                     
-                    # Format accumulated time into MM:SS (or HH:MM:SS)
                     total_sec = int(self.call_times.get(tg_key, 0))
                     mins, secs = divmod(total_sec, 60)
                     hours, mins = divmod(mins, 60)
@@ -537,7 +541,7 @@ class VirtualScanner(tk.Tk):
         else:
             if not self.active_call:
                 self.active_call = True
-                self.current_call_start = time.time()  # Start timing when scanner locks on
+                self.current_call_start = time.time()
                 self.current_uid = self.current_tgid = ""
                 self.log_sys, self.log_dept, self.log_chan = ScrollCatcher(), ScrollCatcher(), ScrollCatcher()
                 
