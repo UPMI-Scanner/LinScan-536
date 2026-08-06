@@ -30,11 +30,9 @@ class ScrollCatcher:
         if not current.strip():
             self.full_text = self.last_seen = current
             return current
-
         if not self.full_text:
             self.full_text = self.last_seen = current
             return self.full_text
-
         if current == self.last_seen:
             return self.full_text
 
@@ -44,17 +42,14 @@ class ScrollCatcher:
             else: break
         
         last_rem, curr_rem = self.last_seen[prefix_len:], current[prefix_len:]
-        
         if len(last_rem) > 1 and len(curr_rem) > 1 and last_rem[1:] == curr_rem[:-1]:
             self.full_text += curr_rem[-1]
             self.last_seen = current
             return self.full_text
-                
         if len(last_rem) > 2 and len(curr_rem) > 2 and last_rem[2:] == curr_rem[:-2]:
             self.full_text += curr_rem[-2:]
             self.last_seen = current
             return self.full_text
-
         if self.full_text.startswith(current):
             self.last_seen = current
             return self.full_text
@@ -81,19 +76,16 @@ class ProScanRTSPEngine(threading.Thread):
         ]
         try:
             self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            self.log_callback(f"[REC ERROR] FFmpeg start failed: {str(e)}")
+        except Exception:
             return
 
         while self.running:
             try:
                 self.connect_and_stream()
-            except Exception as e:
+            except Exception:
                 if self.running:
-                    self.log_callback(f"[REC WARN] Stream drop ({str(e)}). Reconnecting...")
                     self.close_sockets()
                     time.sleep(2)
-
         self.cleanup()
 
     def connect_and_stream(self):
@@ -112,7 +104,6 @@ class ProScanRTSPEngine(threading.Thread):
             f"DESCRIBE rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan-536\r\nAccept: application/sdp\r\n\r\n",
             f"SETUP rtsp://{self.ip}/au:scanner.au/trackID=1 RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan-536\r\nTransport: RTP/AVP;unicast;client_port={rtp_port}-{rtcp_port}\r\n\r\n"
         ]
-
         for req in reqs[:2]:
             self.tcp_sock.sendall(req.format(cseq).encode())
             self.tcp_sock.recv(1024)
@@ -182,13 +173,11 @@ class ProScanRTSPEngine(threading.Thread):
             try:
                 if os.path.getsize(self.mp3_file) < 20000:
                     os.remove(self.mp3_file)
-                    self.log_callback("[SYSTEM] Auto-purged short noise spike (< 2 sec).")
                 else:
                     new_name = f"Session_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
                     new_path = os.path.join(os.path.dirname(self.mp3_file), new_name)
                     if os.path.exists(new_path): os.remove(new_path)
                     os.rename(self.mp3_file, new_path)
-                    self.log_callback(f"[SYSTEM] Audio Saved: {new_name}")
             except Exception: pass
 
 
@@ -208,7 +197,11 @@ class VirtualScanner(tk.Tk):
         self.log_sys = ScrollCatcher()
         self.log_dept = ScrollCatcher()
         self.log_chan = ScrollCatcher()
+        
+        # Tracking dictionaries for grid statistics
         self.tg_hits = {}
+        self.call_times = {}
+        self.current_call_start = None
 
         self.ip_file = os.path.expanduser("~/linscan_ip.txt")
         self.load_ip()
@@ -222,7 +215,6 @@ class VirtualScanner(tk.Tk):
         self.software_panel = tk.Frame(self, bg="#050505")
         self.software_panel.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
-        # --- VOL & SQL PANEL ---
         self.vol_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
         self.vol_panel.pack(side=tk.LEFT, fill=tk.Y, padx=20, pady=20)
         
@@ -236,7 +228,6 @@ class VirtualScanner(tk.Tk):
             if name == "VOL": self.vol_slider = slider
             else: self.sql_slider = slider
 
-        # --- KEYPAD PANEL ---
         self.keypad_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
         self.keypad_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=20, pady=20)
         self.center_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
@@ -284,7 +275,6 @@ class VirtualScanner(tk.Tk):
         for text, key_code in [("SYS", 'A'), ("DEPT", 'B'), ("CH", 'C'), ("AVOID", 'L'), ("ZIP", 'Z'), ("SERV", 'S')]:
             tk.Button(soft_f, text=text, height=2, command=lambda k=key_code: self.send_key(k), **btn_style).pack(side=tk.LEFT, padx=4, expand=True, fill=tk.X)
 
-        # --- ACTIVITY LOG CONTROL BAR ---
         self.log_ctrl_frame = tk.Frame(self.software_panel, bg="#050505")
         self.log_ctrl_frame.pack(fill=tk.X, pady=(0, 5))
         tk.Label(self.log_ctrl_frame, text="ACTIVITY TABLE (Double-click row to Hold Channel)", fg="#00FFFF", bg="#050505", font=("Courier", 11, "bold")).pack(side=tk.LEFT)
@@ -300,18 +290,17 @@ class VirtualScanner(tk.Tk):
         self.sd_rec_btn = tk.Button(self.log_ctrl_frame, text="SD REC", fg="#FF0000", command=self.toggle_sd_record, **btn_config)
         self.sd_rec_btn.pack(side=tk.RIGHT, padx=4)
 
-        # --- DEDUPLICATED TALKGROUP TABLE ---
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Treeview", background="#FFFFFF", foreground="#000000", fieldbackground="#FFFFFF", rowheight=32, font=("Arial", 12, "bold"))
         style.configure("Treeview.Heading", background="#D0D0D0", foreground="#000000", font=("Arial", 11, "bold"), relief="raised")
         style.map("Treeview", background=[("selected", "#0055FF")], foreground=[("selected", "#FFFFFF")])
 
-        self.tree_columns = ("time", "sys", "dept", "chan", "tgid", "uid", "hits")
+        self.tree_columns = ("time", "sys", "dept", "chan", "tgid", "uid", "hits", "call_time")
         self.log_tree = ttk.Treeview(self.software_panel, columns=self.tree_columns, show="headings", selectmode="browse")
         
-        cols_config = [("time", "LAST SEEN", 125, "center"), ("sys", "SYSTEM", 190, "w"), ("dept", "DEPARTMENT", 190, "w"), ("chan", "CHANNEL", 190, "w"), 
-                       ("tgid", "TGID", 85, "center"), ("uid", "LAST UID", 110, "center"), ("hits", "HITS", 65, "center")]
+        cols_config = [("time", "LAST SEEN", 110, "center"), ("sys", "SYSTEM", 185, "w"), ("dept", "DEPARTMENT", 185, "w"), ("chan", "CHANNEL", 185, "w"), 
+                       ("tgid", "TGID", 80, "center"), ("uid", "LAST UID", 100, "center"), ("hits", "HITS", 60, "center"), ("call_time", "TIME", 80, "center")]
         for col_id, heading, width, anchor in cols_config:
             self.log_tree.heading(col_id, text=heading)
             self.log_tree.column(col_id, width=width, anchor=anchor)
@@ -348,7 +337,7 @@ class VirtualScanner(tk.Tk):
         if out_path:
             with open(out_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Last Seen", "System", "Department", "Channel", "TGID", "Last UID", "Hits"])
+                writer.writerow(["Last Seen", "System", "Department", "Channel", "TGID", "Last UID", "Hits", "Call Time"])
                 for item in items: writer.writerow(self.log_tree.item(item)["values"])
 
     def load_ip(self):
@@ -416,6 +405,7 @@ class VirtualScanner(tk.Tk):
     def clear_log(self):
         for item in self.log_tree.get_children(): self.log_tree.delete(item)
         self.tg_hits.clear()
+        self.call_times.clear()
 
     def send_key(self, key_code):
         if self.ser and self.ser.is_open:
@@ -450,12 +440,7 @@ class VirtualScanner(tk.Tk):
                         self._last_status = "CONNECTED"
                         self.ser.write(b'VOL\rSQL\r')
                         break
-                    except PermissionError:
-                        self.status_label.config(text="PERM DENIED", fg="#FF0033")
-                        self._last_status = "PERM DENIED"
-                    except Exception:
-                        self.status_label.config(text="PORT ERROR", fg="#FF0033")
-                        self._last_status = "PORT ERROR"
+                    except Exception: pass
         self.after(2000, self.poll_connection)
 
     def request_data(self):
@@ -523,8 +508,22 @@ class VirtualScanner(tk.Tk):
                 
                 if chan_final and not any(x in chan_upper for x in ("SCAN", "ID SEARCH", "SEARCHING")):
                     tg_key = self.current_tgid or chan_final
+                    
+                    # Track elapsed time for this transmission
+                    if self.current_call_start is not None:
+                        elapsed = time.time() - self.current_call_start
+                        self.call_times[tg_key] = self.call_times.get(tg_key, 0.0) + elapsed
+                        self.current_call_start = None
+
                     self.tg_hits[tg_key] = self.tg_hits.get(tg_key, 0) + 1
-                    row_vals = (datetime.datetime.now().strftime("%I:%M:%S %p"), sys_final, dept_final, chan_final, self.current_tgid, self.current_uid, self.tg_hits[tg_key])
+                    
+                    # Format accumulated time into MM:SS (or HH:MM:SS)
+                    total_sec = int(self.call_times.get(tg_key, 0))
+                    mins, secs = divmod(total_sec, 60)
+                    hours, mins = divmod(mins, 60)
+                    time_str = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
+
+                    row_vals = (datetime.datetime.now().strftime("%I:%M:%S %p"), sys_final, dept_final, chan_final, self.current_tgid, self.current_uid, self.tg_hits[tg_key], time_str)
                     
                     if self.log_tree.exists(tg_key):
                         self.log_tree.item(tg_key, values=row_vals)
@@ -538,6 +537,7 @@ class VirtualScanner(tk.Tk):
         else:
             if not self.active_call:
                 self.active_call = True
+                self.current_call_start = time.time()  # Start timing when scanner locks on
                 self.current_uid = self.current_tgid = ""
                 self.log_sys, self.log_dept, self.log_chan = ScrollCatcher(), ScrollCatcher(), ScrollCatcher()
                 
