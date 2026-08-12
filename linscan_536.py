@@ -57,6 +57,53 @@ class ScrollCatcher:
         self.full_text = self.last_seen = current
         return self.full_text
 
+class USBRecordingEngine(threading.Thread):
+    def __init__(self, mp3_file):
+        super().__init__()
+        self.mp3_file = mp3_file
+        self.running = True
+        self.ffmpeg_proc = None
+
+    def run(self):
+        print(f"\n\033[1;36m========================================\033[0m", flush=True)
+        print(f"\033[1;32m🎙️ USB SOUNDCARD RECORDING IN PROGRESS\033[0m", flush=True)
+        print(f"\033[1;33mSaving to:\033[0m {self.mp3_file}", flush=True)
+        print(f"\033[1;36m========================================\033[0m\n", flush=True)
+
+        vox_filter = "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB:stop_periods=-1:stop_duration=2:stop_threshold=-45dB"
+        norm_filter = "loudnorm=I=-16:TP=-1.5:LRA=11"
+        
+        ffmpeg_cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
+            '-f', 'pulse', '-i', 'default',
+            '-af', f"aresample=async=1,{vox_filter},{norm_filter}",
+            '-c:a', 'libmp3lame', '-b:a', '64k', self.mp3_file
+        ]
+        
+        try:
+            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True)
+            self._monitor_recording()
+        except Exception:
+            pass
+
+    def _monitor_recording(self):
+        if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
+        try:
+            while self.running:
+                line = self.ffmpeg_proc.stderr.readline()
+                if not line: break
+                m = re.search(r'time=([0-9:\.]+)', line)
+                if m:
+                    print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
+        except Exception: pass
+
+    def stop(self):
+        self.running = False
+        print("\n\n\033[1;31m⏹ Stopping USB recording...\033[0m", flush=True)
+        if self.ffmpeg_proc:
+            try: self.ffmpeg_proc.terminate()
+            except Exception: pass
+
 class ProScanRTSPEngine(threading.Thread):
     def __init__(self, scanner_ip, mp3_file, log_callback):
         super().__init__()
@@ -68,14 +115,21 @@ class ProScanRTSPEngine(threading.Thread):
         self.start_time = datetime.datetime.now()
 
     def run(self):
-        audio_filter = "volume=3.0,silenceremove=start_periods=1:start_duration=0.05:start_threshold=-38dB:stop_periods=-1:stop_duration=0.8:stop_threshold=-38dB"
+        print(f"\n\033[1;36m========================================\033[0m", flush=True)
+        print(f"\033[1;32m🎙️ WIFI RECORDING IN PROGRESS\033[0m", flush=True)
+        print(f"\033[1;33mSaving to:\033[0m {self.mp3_file}", flush=True)
+        print(f"\033[1;36m========================================\033[0m\n", flush=True)
+        
+        audio_filter = "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-38dB:stop_periods=-1:stop_duration=0.8:stop_threshold=-38dB,loudnorm=I=-16:TP=-1.5:LRA=11"
+        
         ffmpeg_cmd = [
-            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-y',
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
             '-f', 'mulaw', '-ar', '8000', '-ac', '1', '-i', 'pipe:0',
             '-af', audio_filter, '-c:a', 'libmp3lame', '-b:a', '64k', self.mp3_file
         ]
         try:
-            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True)
+            threading.Thread(target=self._monitor_recording, daemon=True).start()
         except Exception:
             return
 
@@ -87,6 +141,15 @@ class ProScanRTSPEngine(threading.Thread):
                     self.close_sockets()
                     time.sleep(2)
         self.cleanup()
+
+    def _monitor_recording(self):
+        if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
+        try:
+            for line in self.ffmpeg_proc.stderr:
+                m = re.search(r'time=([0-9:\.]+)', line)
+                if m:
+                    print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
+        except Exception: pass
 
     def connect_and_stream(self):
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -100,9 +163,9 @@ class ProScanRTSPEngine(threading.Thread):
 
         cseq = 1
         reqs = [
-            f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan-536\r\n\r\n",
-            f"DESCRIBE rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan-536\r\nAccept: application/sdp\r\n\r\n",
-            f"SETUP rtsp://{self.ip}/au:scanner.au/trackID=1 RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan-536\r\nTransport: RTP/AVP;unicast;client_port={rtp_port}-{rtcp_port}\r\n\r\n"
+            f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan\r\n\r\n",
+            f"DESCRIBE rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan\r\nAccept: application/sdp\r\n\r\n",
+            f"SETUP rtsp://{self.ip}/au:scanner.au/trackID=1 RTSP/1.0\r\nCSeq: {{}}\r\nUser-Agent: LinScan\r\nTransport: RTP/AVP;unicast;client_port={rtp_port}-{rtcp_port}\r\n\r\n"
         ]
         for req in reqs[:2]:
             self.tcp_sock.sendall(req.format(cseq).encode())
@@ -116,7 +179,7 @@ class ProScanRTSPEngine(threading.Thread):
         session_id = (re.search(r'Session:\s*([^\r\n;]+)', resp, re.IGNORECASE) or [None, ""])[1].strip()
         server_port = int((re.search(r'server_port=\s*([0-9]+)', resp, re.IGNORECASE) or [None, 5004])[1])
 
-        req = f"PLAY rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: LinScan-536\r\nSession: {session_id}\r\nRange: npt=0.000-\r\n\r\n"
+        req = f"PLAY rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: LinScan\r\nSession: {session_id}\r\nRange: npt=0.000-\r\n\r\n"
         self.tcp_sock.sendall(req.encode())
         self.tcp_sock.recv(1024)
         cseq += 1
@@ -129,7 +192,7 @@ class ProScanRTSPEngine(threading.Thread):
         while self.running:
             if time.time() - last_ping > 10.0:
                 try:
-                    self.tcp_sock.sendall(f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {session_id}\r\nUser-Agent: LinScan-536\r\n\r\n".encode())
+                    self.tcp_sock.sendall(f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {session_id}\r\nUser-Agent: LinScan\r\n\r\n".encode())
                     self.tcp_sock.recv(512)
                     cseq += 1
                 except Exception: pass
@@ -146,8 +209,9 @@ class ProScanRTSPEngine(threading.Thread):
 
     def stop(self):
         self.running = False
+        print("\n\n\033[1;31m⏹ Stopping WIFI recording...\033[0m", flush=True)
         if self.tcp_sock:
-            try: self.tcp_sock.sendall(f"TEARDOWN rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: 99\r\nUser-Agent: LinScan-536\r\n\r\n".encode())
+            try: self.tcp_sock.sendall(f"TEARDOWN rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: 99\r\nUser-Agent: LinScan\r\n\r\n".encode())
             except Exception: pass
         self.close_sockets()
 
@@ -184,23 +248,28 @@ class ProScanRTSPEngine(threading.Thread):
 class VirtualScanner(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LinScan-536")
+        self.title("LinScan")
         self.geometry("1100x780")
         self.minsize(1050, 650) 
         self.configure(bg="#050505")
         
-        self.ser = self.rtsp_engine = None
+        self.ser = self.rtsp_engine = self.usb_engine = None
         self.serial_buffer = b""
         self.catchers = [ScrollCatcher() for _ in range(20)]
-        self.active_call = self.record_enabled = self._ignore_slider_events = False
+        self.active_call = self.record_enabled = self.usb_record_enabled = self._ignore_slider_events = False
         self.current_uid = self.current_tgid = self.scanner_ip = ""
         self.log_sys = ScrollCatcher()
         self.log_dept = ScrollCatcher()
         self.log_chan = ScrollCatcher()
+        self.poll_counter = 0 
         
         self.tg_hits = {}
         self.call_times = {}
         self.current_call_start = None
+
+        # --- NEW: Configured LCD screen colors to cycle through ---
+        self.lcd_colors = ["#C0C0C0", "#FFA500", "#39FF14", "#00FFFF", "#FFB6C1", "#ADD8E6"]
+        self.current_color_idx = 0
 
         self.ip_file = os.path.expanduser("~/linscan_ip.txt")
         self.load_ip()
@@ -253,12 +322,12 @@ class VirtualScanner(tk.Tk):
         self.lcd_header = tk.Frame(self.center_panel, bg="#1a1a1a")
         self.lcd_header.pack(fill=tk.X, padx=20, pady=(0, 5))
         
-        tk.Label(self.lcd_header, text="UNIDEN BCD536HP", fg="#AAAAAA", bg="#1a1a1a", font=("Arial", 14, "bold")).pack(side=tk.LEFT)
+        tk.Label(self.lcd_header, text="UNIDEN SCANNER", fg="#AAAAAA", bg="#1a1a1a", font=("Arial", 14, "bold")).pack(side=tk.LEFT)
         self.status_label = tk.Label(self.lcd_header, text="CONNECTING...", fg="#39FF14", bg="#1a1a1a", font=("Courier", 14, "bold"))
         self.status_label.pack(side=tk.RIGHT)
         self.sig_label = tk.Label(self.lcd_header, text="SIG: \u25a1 \u25a1 \u25a1 \u25a1 \u25a1", fg="#555555", bg="#1a1a1a", font=("Courier", 14, "bold"))
         self.sig_label.pack(side=tk.RIGHT, padx=15)
-        self.cc_indicator = tk.Label(self.lcd_header, text="\u2B24 CC: SYNC", fg="#555555", bg="#1a1a1a", font=("Arial", 14, "bold"))
+        self.cc_indicator = tk.Label(self.lcd_header, text="\u2B24 CC: OFF", fg="#555555", bg="#1a1a1a", font=("Arial", 14, "bold"))
         self.cc_indicator.pack(side=tk.RIGHT, padx=15)
 
         self.bezel = tk.Frame(self.center_panel, bg="#050505", highlightthickness=2, highlightbackground="#333333")
@@ -284,13 +353,29 @@ class VirtualScanner(tk.Tk):
             
         self.ip_btn = tk.Button(self.log_ctrl_frame, text="SET IP", fg="#FFFF00", command=self.set_ip, **btn_config)
         self.ip_btn.pack(side=tk.RIGHT, padx=4)
+        
         self.wifi_rec_btn = tk.Button(self.log_ctrl_frame, text="○ WIFI REC", fg="#888888", command=self.toggle_wifi_record, **btn_config)
         self.wifi_rec_btn.pack(side=tk.RIGHT, padx=4)
+        
+        self.usb_rec_btn = tk.Button(self.log_ctrl_frame, text="○ USB REC", fg="#888888", command=self.toggle_usb_record, **btn_config)
+        self.usb_rec_btn.pack(side=tk.RIGHT, padx=4)
+        
         self.sd_rec_btn = tk.Button(self.log_ctrl_frame, text="SD REC", fg="#FF0000", command=self.toggle_sd_record, **btn_config)
         self.sd_rec_btn.pack(side=tk.RIGHT, padx=4)
 
+        # --- NEW: Added LCD Color Toggle Button ---
+        self.color_btn = tk.Button(self.log_ctrl_frame, text="LCD COLOR", fg="#FFFFFF", command=self.cycle_lcd_color, **btn_config)
+        self.color_btn.pack(side=tk.RIGHT, padx=4)
+
         style = ttk.Style()
-        style.theme_use("clam")
+        style.theme_use("default") 
+        
+        try:
+            def fixed_map(option):
+                return [elm for elm in style.map("Treeview", query_opt=option) if elm[:2] != ("!disabled", "!selected")]
+            style.map("Treeview", foreground=fixed_map("foreground"), background=fixed_map("background"))
+        except Exception: pass
+        
         style.configure("Treeview", background="#FFFFFF", foreground="#000000", fieldbackground="#FFFFFF", rowheight=32, font=("Arial", 12, "bold"))
         style.configure("Treeview.Heading", background="#D0D0D0", foreground="#000000", font=("Arial", 11, "bold"), relief="raised")
         style.map("Treeview", background=[("selected", "#0055FF")], foreground=[("selected", "#FFFFFF")])
@@ -309,12 +394,25 @@ class VirtualScanner(tk.Tk):
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_tree.config(yscrollcommand=self.scrollbar.set)
 
+        self.log_tree.tag_configure("law", background="#E6F0FA", foreground="#000000")
+        self.log_tree.tag_configure("fire", background="#FAE6E6", foreground="#000000")
+        self.log_tree.tag_configure("ems", background="#E6FAE6", foreground="#000000")
+        self.log_tree.tag_configure("works", background="#FAF0E6", foreground="#000000")
+        self.log_tree.tag_configure("dnr", background="#E6F5EA", foreground="#000000")
+        self.log_tree.tag_configure("default", background="#FFFFFF", foreground="#000000")
+
         self.log_tree.bind("<Double-1>", lambda e: self.send_key('H') if self.log_tree.selection() else None)
         self.bind_all("<Key>", self.handle_keypress)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.poll_connection()
+        self.poll_hardware_state()
         self.request_data()
         self.read_data()
+
+    # --- NEW: Function to cycle screen colors and redraw immediately ---
+    def cycle_lcd_color(self):
+        self.current_color_idx = (self.current_color_idx + 1) % len(self.lcd_colors)
+        self.draw_lcd()
 
     def handle_keypress(self, event):
         sym, key = event.keysym, event.char.lower()
@@ -331,7 +429,7 @@ class VirtualScanner(tk.Tk):
     def export_csv(self):
         items = self.log_tree.get_children()
         if not items: return
-        default_name = f"LinScan_Log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default_name = f"LinScan_Log_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.csv"
         out_path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=default_name, filetypes=[("CSV Files", "*.csv")])
         if out_path:
             with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -360,6 +458,22 @@ class VirtualScanner(tk.Tk):
                 self.after(300, lambda: self.ser.write(b'KEY,Y,P\r'))
             except Exception: pass
 
+    def toggle_usb_record(self):
+        self.usb_record_enabled = not self.usb_record_enabled
+        if self.usb_record_enabled:
+            self.usb_rec_btn.config(text="● USB REC", fg="#FF0000")
+            os.makedirs(os.path.expanduser("~/LinScan_Audio"), exist_ok=True)
+            mp3_file = os.path.expanduser(f"~/LinScan_Audio/Session_USB_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3")
+            self.usb_engine = USBRecordingEngine(mp3_file)
+            self.usb_engine.daemon = True
+            self.usb_engine.start()
+        else:
+            self.usb_rec_btn.config(text="○ USB REC", fg="#888888")
+            if self.usb_engine:
+                self.usb_engine.stop()
+                self.usb_engine.join(timeout=4.0)
+                self.usb_engine = None
+
     def toggle_wifi_record(self):
         if not self.scanner_ip:
             self.set_ip()
@@ -369,7 +483,7 @@ class VirtualScanner(tk.Tk):
         if self.record_enabled:
             self.wifi_rec_btn.config(text="● WIFI REC", fg="#FF0000")
             os.makedirs(os.path.expanduser("~/LinScan_Audio"), exist_ok=True)
-            vox_file = os.path.expanduser(f"~/LinScan_Audio/Session_VOX_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3")
+            vox_file = os.path.expanduser(f"~/LinScan_Audio/Session_VOX_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3")
             self.rtsp_engine = ProScanRTSPEngine(self.scanner_ip, vox_file, lambda msg: None)
             self.rtsp_engine.daemon = True
             self.rtsp_engine.start()
@@ -384,7 +498,9 @@ class VirtualScanner(tk.Tk):
         width, height = self.lcd_canvas.winfo_width(), self.lcd_canvas.winfo_height()
         if width < 50 or height < 50: return
         self.lcd_canvas.delete("bg_shape")
-        r, c = 20, "#FFA500" 
+        
+        # --- NEW: Now dynamically pulling the active color from your list ---
+        r, c = 20, self.lcd_colors[self.current_color_idx] 
         for coords in [(0, 0, 2*r, 2*r), (width-2*r, 0, width, 2*r), (0, height-2*r, 2*r, height), (width-2*r, height-2*r, width, height)]:
             self.lcd_canvas.create_oval(*coords, fill=c, outline=c, tags="bg_shape")
         self.lcd_canvas.create_rectangle(r, 0, width-r, height, fill=c, outline=c, tags="bg_shape")
@@ -395,9 +511,13 @@ class VirtualScanner(tk.Tk):
 
     def on_closing(self):
         self.record_enabled = False
+        self.usb_record_enabled = False
         if self.rtsp_engine:
             self.rtsp_engine.stop()
             self.rtsp_engine.join(timeout=3.0)
+        if self.usb_engine:
+            self.usb_engine.stop()
+            self.usb_engine.join(timeout=3.0)
         if self.ser and self.ser.is_open: self.ser.close()
         self.destroy()
 
@@ -423,6 +543,12 @@ class VirtualScanner(tk.Tk):
             try: self.ser.write(f"SQL,{int(val):02d}\r".encode('ascii'))
             except Exception: pass
 
+    def poll_hardware_state(self):
+        if self.ser and self.ser.is_open:
+            try: self.ser.write(b'VOL\rSQL\rCLC\r')
+            except Exception: pass
+        self.after(1500, self.poll_hardware_state)
+
     def poll_connection(self):
         if not self.ser or not self.ser.is_open:
             ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
@@ -438,12 +564,9 @@ class VirtualScanner(tk.Tk):
                         self.status_label.config(text=f"CONNECTED ({os.path.basename(p)})", fg="#39FF14")
                         self._last_status = "CONNECTED"
                         
-                        # --- NEW: Auto-Sync Scanner Time to Computer Time ---
                         now = datetime.datetime.now()
                         dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
                         time_cmd = f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r"
-                        
-                        self.ser.write(b'VOL\rSQL\r')
                         self.ser.write(time_cmd.encode('ascii'))
                         break
                     except Exception: pass
@@ -451,7 +574,14 @@ class VirtualScanner(tk.Tk):
 
     def request_data(self):
         if self.ser and self.ser.is_open:
-            try: self.ser.write(b'STS\r')
+            try:
+                self.poll_counter += 1
+                if self.poll_counter % 15 == 5:
+                    self.ser.write(b'VOL\r')
+                elif self.poll_counter % 15 == 10:
+                    self.ser.write(b'SQL\r')
+                else:
+                    self.ser.write(b'STS\r')
             except Exception: self.ser.close()
         self.after(150, self.request_data)
 
@@ -477,6 +607,13 @@ class VirtualScanner(tk.Tk):
                             self.sql_slider.set(int(line.split(',')[1]))
                             self._ignore_slider_events = False
                         except Exception: pass
+                    elif line.startswith('CLC,'):
+                        try:
+                            mode = line.split(',')[1].strip()
+                            if mode == '0': self.cc_indicator.config(text="\u2B24 CC: OFF", fg="#555555")
+                            elif mode == '1': self.cc_indicator.config(text="\u2B24 CC: PRI", fg="#FF0000")
+                            elif mode == '2': self.cc_indicator.config(text="\u2B24 CC: DND", fg="#FFFF00")
+                        except Exception: pass
             except Exception: self.ser.close()
         self.after(20, self.read_data)
 
@@ -492,12 +629,19 @@ class VirtualScanner(tk.Tk):
         for field in fields[11:]:
             text = clean_text(field).upper()
             if "UID:" in text: uid_raw = text.replace("UID:", "").strip()
-            elif "TGID:" in text: tgid_name = text.replace("TGID:", "").strip()
+            elif "TGID:" in text: 
+                raw_tgid = text.replace("TGID:", "").strip()
+                nums = re.findall(r'\d+', raw_tgid)
+                if nums:
+                    tgid_name = nums[-1]
+                else:
+                    tgid_name = raw_tgid
 
         screen_lines = []
         for i, fld_idx in enumerate(range(2, min(len(fields) - 8, 42), 2)):
             clean_line = keep_spaces(fields[fld_idx])
             screen_lines.append(self.catchers[i].update(clean_line))
+            
             upper_line = clean_line.upper()
             if "CC DND" in upper_line: self.cc_indicator.config(text="\u2B24 CC: DND", fg="#FFFF00")
             elif "CC PRI" in upper_line: self.cc_indicator.config(text="\u2B24 CC: PRI", fg="#FF0000")
@@ -527,13 +671,33 @@ class VirtualScanner(tk.Tk):
                     hours, mins = divmod(mins, 60)
                     time_str = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
 
-                    row_vals = (datetime.datetime.now().strftime("%I:%M:%S %p"), sys_final, dept_final, chan_final, self.current_tgid, self.current_uid, self.tg_hits[tg_key], time_str)
+                    display_tgid = self.current_tgid
+                    if display_tgid:
+                        just_nums = "".join(filter(str.isdigit, display_tgid))
+                        if just_nums:
+                            display_tgid = just_nums
+
+                    row_vals = (datetime.datetime.now().strftime("%I:%M:%S %p"), sys_final, dept_final, chan_final, display_tgid, self.current_uid, self.tg_hits[tg_key], time_str)
                     
+                    row_tag = "default"
+                    combo_text = f"{dept_final} {chan_final}".upper()
+                    
+                    if any(x in combo_text for x in ("POLICE", "LAW", "SHERIFF", "STATE POLICE", "POST 81")):
+                        row_tag = "law"
+                    elif any(x in combo_text for x in ("FIRE",)):
+                        row_tag = "fire"
+                    elif any(x in combo_text for x in ("EMS", "AMBULANCE", "HOSPITAL", "MEDICAL", "FIRST RESPONDERS")):
+                        row_tag = "ems"
+                    elif any(x in combo_text for x in ("ROAD", "PUBLIC WORKS", "DPW", "COMMISSION")):
+                        row_tag = "works"
+                    elif any(x in combo_text for x in ("NATURAL RES", "PARK", "DNR", "FOREST", "FISH AND WILDLIFE")):
+                        row_tag = "dnr"
+
                     if self.log_tree.exists(tg_key):
-                        self.log_tree.item(tg_key, values=row_vals)
+                        self.log_tree.item(tg_key, values=row_vals, tags=(row_tag,))
                         self.log_tree.move(tg_key, "", 0)
                     else:
-                        self.log_tree.insert("", 0, iid=tg_key, values=row_vals)
+                        self.log_tree.insert("", 0, iid=tg_key, values=row_vals, tags=(row_tag,))
 
                 self.active_call = False
                 self.current_uid = self.current_tgid = ""
