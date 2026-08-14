@@ -81,7 +81,7 @@ class USBRecordingEngine(threading.Thread):
         ]
         
         try:
-            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True)
+            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             self._monitor_recording()
         except Exception:
             pass
@@ -89,9 +89,9 @@ class USBRecordingEngine(threading.Thread):
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
         try:
-            while self.running:
-                line = self.ffmpeg_proc.stderr.readline()
-                if not line: break
+            for raw_line in iter(self.ffmpeg_proc.stderr.readline, b''):
+                if not self.running: break
+                line = raw_line.decode('utf-8', errors='ignore')
                 m = re.search(r'time=([0-9:\.]+)', line)
                 if m:
                     print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
@@ -117,26 +117,29 @@ class ProScanRTSPEngine(threading.Thread):
     def run(self):
         print(f"\n\033[1;36m========================================\033[0m", flush=True)
         print(f"\033[1;32m🎙️ WIFI RECORDING IN PROGRESS\033[0m", flush=True)
+        print(f"\033[1;33mConnecting to IP:\033[0m {self.ip}", flush=True)
         print(f"\033[1;33mSaving to:\033[0m {self.mp3_file}", flush=True)
         print(f"\033[1;36m========================================\033[0m\n", flush=True)
         
-        audio_filter = "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-38dB:stop_periods=-1:stop_duration=0.8:stop_threshold=-38dB,loudnorm=I=-16:TP=-1.5:LRA=11"
+        audio_filter = "volume=3.0,silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,loudnorm=I=-16:TP=-1.5:LRA=11"
         
         ffmpeg_cmd = [
-            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
+            'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
             '-f', 'mulaw', '-ar', '8000', '-ac', '1', '-i', 'pipe:0',
             '-af', audio_filter, '-c:a', 'libmp3lame', '-b:a', '64k', self.mp3_file
         ]
         try:
-            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True)
+            # Kept in raw binary mode so stdin.write works properly with audio bytes
+            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             threading.Thread(target=self._monitor_recording, daemon=True).start()
-        except Exception:
+        except Exception as e:
+            print(f"\033[1;31m❌ FFmpeg error: {e}\033[0m", flush=True)
             return
 
         while self.running:
             try:
                 self.connect_and_stream()
-            except Exception:
+            except Exception as e:
                 if self.running:
                     self.close_sockets()
                     time.sleep(2)
@@ -145,7 +148,9 @@ class ProScanRTSPEngine(threading.Thread):
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
         try:
-            for line in self.ffmpeg_proc.stderr:
+            for raw_line in iter(self.ffmpeg_proc.stderr.readline, b''):
+                if not self.running: break
+                line = raw_line.decode('utf-8', errors='ignore')
                 m = re.search(r'time=([0-9:\.]+)', line)
                 if m:
                     print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
@@ -267,7 +272,6 @@ class VirtualScanner(tk.Tk):
         self.call_times = {}
         self.current_call_start = None
 
-        # --- NEW: Configured LCD screen colors to cycle through ---
         self.lcd_colors = ["#C0C0C0", "#FFA500", "#39FF14", "#00FFFF", "#FFB6C1", "#ADD8E6"]
         self.current_color_idx = 0
 
@@ -363,7 +367,6 @@ class VirtualScanner(tk.Tk):
         self.sd_rec_btn = tk.Button(self.log_ctrl_frame, text="SD REC", fg="#FF0000", command=self.toggle_sd_record, **btn_config)
         self.sd_rec_btn.pack(side=tk.RIGHT, padx=4)
 
-        # --- NEW: Added LCD Color Toggle Button ---
         self.color_btn = tk.Button(self.log_ctrl_frame, text="LCD COLOR", fg="#FFFFFF", command=self.cycle_lcd_color, **btn_config)
         self.color_btn.pack(side=tk.RIGHT, padx=4)
 
@@ -409,7 +412,6 @@ class VirtualScanner(tk.Tk):
         self.request_data()
         self.read_data()
 
-    # --- NEW: Function to cycle screen colors and redraw immediately ---
     def cycle_lcd_color(self):
         self.current_color_idx = (self.current_color_idx + 1) % len(self.lcd_colors)
         self.draw_lcd()
@@ -498,8 +500,6 @@ class VirtualScanner(tk.Tk):
         width, height = self.lcd_canvas.winfo_width(), self.lcd_canvas.winfo_height()
         if width < 50 or height < 50: return
         self.lcd_canvas.delete("bg_shape")
-        
-        # --- NEW: Now dynamically pulling the active color from your list ---
         r, c = 20, self.lcd_colors[self.current_color_idx] 
         for coords in [(0, 0, 2*r, 2*r), (width-2*r, 0, width, 2*r), (0, height-2*r, 2*r, height), (width-2*r, height-2*r, width, height)]:
             self.lcd_canvas.create_oval(*coords, fill=c, outline=c, tags="bg_shape")
