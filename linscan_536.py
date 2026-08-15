@@ -63,6 +63,7 @@ class USBRecordingEngine(threading.Thread):
         self.mp3_file = mp3_file
         self.running = True
         self.ffmpeg_proc = None
+        self.start_time = datetime.datetime.now()
 
     def run(self):
         print(f"\n\033[1;36m========================================\033[0m", flush=True)
@@ -88,20 +89,45 @@ class USBRecordingEngine(threading.Thread):
 
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
+        buf = ""
         try:
-            for raw_line in iter(self.ffmpeg_proc.stderr.readline, b''):
-                if not self.running: break
-                line = raw_line.decode('utf-8', errors='ignore')
-                m = re.search(r'time=([0-9:\.]+)', line)
-                if m:
-                    print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
+            while self.running:
+                chunk = self.ffmpeg_proc.stderr.read(64)
+                if not chunk:
+                    break
+                buf += chunk.decode('utf-8', errors='ignore')
+                while '\r' in buf or '\n' in buf:
+                    parts = re.split(r'[\r\n]', buf, maxsplit=1)
+                    line = parts[0]
+                    buf = parts[1] if len(parts) > 1 else ""
+                    m = re.search(r'time=([0-9:\.]+)', line)
+                    if m:
+                        print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
         except Exception: pass
 
     def stop(self):
         self.running = False
         print("\n\n\033[1;31m⏹ Stopping USB recording...\033[0m", flush=True)
         if self.ffmpeg_proc:
-            try: self.ffmpeg_proc.terminate()
+            try:
+                self.ffmpeg_proc.terminate()
+                self.ffmpeg_proc.wait(timeout=3)
+            except Exception:
+                try: self.ffmpeg_proc.kill()
+                except Exception: pass
+            self.ffmpeg_proc = None
+        self.cleanup()
+
+    def cleanup(self):
+        if os.path.exists(self.mp3_file):
+            try:
+                if os.path.getsize(self.mp3_file) < 20000:
+                    os.remove(self.mp3_file)
+                else:
+                    new_name = f"Session_USB_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    new_path = os.path.join(os.path.dirname(self.mp3_file), new_name)
+                    if os.path.exists(new_path): os.remove(new_path)
+                    os.rename(self.mp3_file, new_path)
             except Exception: pass
 
 class ProScanRTSPEngine(threading.Thread):
@@ -124,12 +150,11 @@ class ProScanRTSPEngine(threading.Thread):
         audio_filter = "volume=3.0,silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,loudnorm=I=-16:TP=-1.5:LRA=11"
         
         ffmpeg_cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-stats', '-y',
             '-f', 'mulaw', '-ar', '8000', '-ac', '1', '-i', 'pipe:0',
             '-af', audio_filter, '-c:a', 'libmp3lame', '-b:a', '64k', self.mp3_file
         ]
         try:
-            # Kept in raw binary mode so stdin.write works properly with audio bytes
             self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             threading.Thread(target=self._monitor_recording, daemon=True).start()
         except Exception as e:
@@ -139,7 +164,7 @@ class ProScanRTSPEngine(threading.Thread):
         while self.running:
             try:
                 self.connect_and_stream()
-            except Exception as e:
+            except Exception:
                 if self.running:
                     self.close_sockets()
                     time.sleep(2)
@@ -147,13 +172,20 @@ class ProScanRTSPEngine(threading.Thread):
 
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr: return
+        buf = ""
         try:
-            for raw_line in iter(self.ffmpeg_proc.stderr.readline, b''):
-                if not self.running: break
-                line = raw_line.decode('utf-8', errors='ignore')
-                m = re.search(r'time=([0-9:\.]+)', line)
-                if m:
-                    print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
+            while self.running:
+                chunk = self.ffmpeg_proc.stderr.read(64)
+                if not chunk:
+                    break
+                buf += chunk.decode('utf-8', errors='ignore')
+                while '\r' in buf or '\n' in buf:
+                    parts = re.split(r'[\r\n]', buf, maxsplit=1)
+                    line = parts[0]
+                    buf = parts[1] if len(parts) > 1 else ""
+                    m = re.search(r'time=([0-9:\.]+)', line)
+                    if m:
+                        print(f"\r   \033[K\033[1;36m⏱ Actual Audio Recorded: \033[1;32m{m.group(1)}\033[0m", end="", flush=True)
         except Exception: pass
 
     def connect_and_stream(self):
@@ -243,7 +275,7 @@ class ProScanRTSPEngine(threading.Thread):
                 if os.path.getsize(self.mp3_file) < 20000:
                     os.remove(self.mp3_file)
                 else:
-                    new_name = f"Session_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    new_name = f"Session_VOX_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
                     new_path = os.path.join(os.path.dirname(self.mp3_file), new_name)
                     if os.path.exists(new_path): os.remove(new_path)
                     os.rename(self.mp3_file, new_path)
@@ -344,7 +376,8 @@ class VirtualScanner(tk.Tk):
 
         soft_f = tk.Frame(self.center_panel, bg="#1a1a1a")
         soft_f.pack(fill=tk.X, padx=20, pady=(10, 5))
-        for text, key_code in [("SYS", 'A'), ("DEPT", 'B'), ("CH", 'C'), ("AVOID", 'L'), ("ZIP", 'Z'), ("SERV", 'S')]:
+        # SERV mapped directly to 'T' (Service Types)
+        for text, key_code in [("SYS", 'A'), ("DEPT", 'B'), ("CH", 'C'), ("AVOID", 'L'), ("ZIP", 'Z'), ("SERV", 'T')]:
             tk.Button(soft_f, text=text, height=2, command=lambda k=key_code: self.send_key(k), **btn_style).pack(side=tk.LEFT, padx=4, expand=True, fill=tk.X)
 
         self.log_ctrl_frame = tk.Frame(self.software_panel, bg="#050505")
@@ -404,7 +437,7 @@ class VirtualScanner(tk.Tk):
         self.log_tree.tag_configure("dnr", background="#E6F5EA", foreground="#000000")
         self.log_tree.tag_configure("default", background="#FFFFFF", foreground="#000000")
 
-        self.log_tree.bind("<Double-1>", lambda e: self.send_key('H') if self.log_tree.selection() else None)
+        self.log_tree.bind("<Double-1>", lambda e: self.send_key('C') if self.log_tree.selection() else None)
         self.bind_all("<Key>", self.handle_keypress)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.poll_connection()
@@ -420,8 +453,13 @@ class VirtualScanner(tk.Tk):
         sym, key = event.keysym, event.char.lower()
         if sym == "Escape": self.send_key('L')
         elif sym in ("Return", "KP_Enter"): self.send_key('E')
-        elif sym == "space": self.send_key('H')
-        elif key in "0123456789abcmy.": self.send_key(key.upper())
+        elif sym == "space": self.send_key('C')
+        
+        key_map = {'a': 'A', 'b': 'B', 'c': 'C', 'm': 'M', 'y': 'Y', 's': 'T', 't': 'T', 'z': 'Z', 'r': 'R', 'q': 'Q', 'l': 'L', 'f': 'F'}
+        if key in key_map:
+            self.send_key(key_map[key])
+        elif key in "0123456789.": 
+            self.send_key(key)
 
     def open_audio_folder(self):
         audio_dir = os.path.expanduser("~/LinScan_Audio")
