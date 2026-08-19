@@ -145,7 +145,7 @@ class SerialManager(threading.Thread):
             if not self.ser or not self.ser.is_open:
                 ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
                 if not ports:
-                    self.data_queue.put(("STATUS", "NO USB DETECTED", "#FF0033"))
+                    self.data_queue.put(("STATUS", ("NO USB DETECTED", "#FF0033")))
                     time.sleep(1.5)
                     continue
 
@@ -153,7 +153,7 @@ class SerialManager(threading.Thread):
                     try:
                         self.ser = serial.Serial(p, BAUD_RATE, timeout=0.1, write_timeout=0.2)
                         self.serial_buffer = b""
-                        self.data_queue.put(("STATUS", f"CONNECTED ({os.path.basename(p)})", "#39FF14"))
+                        self.data_queue.put(("STATUS", (f"CONNECTED ({os.path.basename(p)})", "#39FF14")))
                         now = datetime.datetime.now()
                         dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
                         dtm_cmd = f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r".encode("ascii")
@@ -210,7 +210,6 @@ class SerialManager(threading.Thread):
                     chunk = self.ser.read(self.ser.in_waiting)
                     self.serial_buffer += chunk
 
-                    # Prevent runaway buffer memory accumulation
                     if len(self.serial_buffer) > 4096:
                         self.serial_buffer = self.serial_buffer[-1024:]
 
@@ -231,7 +230,7 @@ class SerialManager(threading.Thread):
             except Exception:
                 pass
         self.ser = None
-        self.data_queue.put(("STATUS", "DISCONNECTED", "#FF0033"))
+        self.data_queue.put(("STATUS", ("DISCONNECTED", "#FF0033")))
 
     def stop(self):
         self.running = False
@@ -497,7 +496,6 @@ class VirtualScanner(tk.Tk):
         self.current_color_idx = 0
 
         self.ip_file = os.path.expanduser("~/linscan_ip.txt")
-        self._last_status = ""
         self._last_sig = ""
         self._last_sig_color = ""
         self._last_scan_state = None
@@ -506,7 +504,6 @@ class VirtualScanner(tk.Tk):
         self._build_ui()
         self.load_ip()
 
-        # Thread-safe communication queue from serial worker
         self.serial_queue = queue.Queue()
         self.serial_manager = SerialManager(self.serial_queue)
         self.serial_manager.start()
@@ -514,7 +511,6 @@ class VirtualScanner(tk.Tk):
         self.bind_all("<Key>", self.handle_keypress)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # Process serial updates on UI loop
         self.process_serial_queue()
 
     def _build_ui(self):
@@ -937,14 +933,15 @@ class VirtualScanner(tk.Tk):
 
         while not self.serial_queue.empty():
             try:
-                msg_type, payload = self.serial_queue.get_nowait()
+                item = self.serial_queue.get_nowait()
+                msg_type = item[0]
+
                 if msg_type == "STATUS":
-                    text, color = payload, "#39FF14"
-                    if isinstance(payload, tuple) or len(payload) == 2:
-                        text, color = payload[0], payload[1]
+                    status_tuple = item[1]
+                    text, color = status_tuple[0], status_tuple[1]
                     self.status_label.config(text=text, fg=color)
                 elif msg_type == "RAW":
-                    line = payload
+                    line = item[1]
                     if line.startswith("STS,"):
                         latest_sts = line
                     elif line.startswith("VOL,"):
