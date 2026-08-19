@@ -11,6 +11,7 @@ import csv
 import datetime
 import glob
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -116,6 +117,127 @@ class ScrollCatcher:
         return self.full_text
 
 
+class SerialManager(threading.Thread):
+    """
+    Dedicated background serial worker thread.
+    Handles all port discovery, polling, reading, and writing off the main GUI thread.
+    """
+
+    def __init__(self, data_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.data_queue = data_queue
+        self.cmd_queue = queue.Queue()
+        self.running = True
+        self.ser = None
+        self.serial_buffer = b""
+
+    def send_cmd(self, cmd: bytes):
+        """Enqueue a command to be sent asynchronously to the scanner."""
+        self.cmd_queue.put(cmd)
+
+    def run(self):
+        poll_timer = 0.0
+        hw_timer = 0.0
+        poll_cycle = 0
+
+        while self.running:
+            # 1. Connection check / Reconnect
+            if not self.ser or not self.ser.is_open:
+                ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+                if not ports:
+                    self.data_queue.put(("STATUS", "NO USB DETECTED", "#FF0033"))
+                    time.sleep(1.5)
+                    continue
+
+                for p in ports:
+                    try:
+                        self.ser = serial.Serial(p, BAUD_RATE, timeout=0.1, write_timeout=0.2)
+                        self.serial_buffer = b""
+                        self.data_queue.put(("STATUS", f"CONNECTED ({os.path.basename(p)})", "#39FF14"))
+                        now = datetime.datetime.now()
+                        dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
+                        dtm_cmd = f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r".encode("ascii")
+                        self.ser.write(dtm_cmd)
+                        break
+                    except Exception:
+                        self.ser = None
+
+                if not self.ser:
+                    time.sleep(1.5)
+                    continue
+
+            # 2. Process outgoing commands from GUI
+            while not self.cmd_queue.empty():
+                try:
+                    cmd = self.cmd_queue.get_nowait()
+                    if self.ser and self.ser.is_open:
+                        self.ser.write(cmd)
+                except Exception:
+                    self._close_port()
+                    break
+
+            if not self.ser or not self.ser.is_open:
+                continue
+
+            now = time.time()
+
+            # 3. Scheduled polling
+            if now - poll_timer >= 0.15:
+                poll_timer = now
+                poll_cycle += 1
+                try:
+                    if poll_cycle % 15 == 5:
+                        self.ser.write(b"VOL\r")
+                    elif poll_cycle % 15 == 10:
+                        self.ser.write(b"SQL\r")
+                    else:
+                        self.ser.write(b"STS\r")
+                except Exception:
+                    self._close_port()
+                    continue
+
+            if now - hw_timer >= 2.0:
+                hw_timer = now
+                try:
+                    self.ser.write(b"VOL\rSQL\rCLC\r")
+                except Exception:
+                    self._close_port()
+                    continue
+
+            # 4. Read incoming serial stream
+            try:
+                if self.ser.in_waiting:
+                    chunk = self.ser.read(self.ser.in_waiting)
+                    self.serial_buffer += chunk
+
+                    # Prevent runaway buffer memory accumulation
+                    if len(self.serial_buffer) > 4096:
+                        self.serial_buffer = self.serial_buffer[-1024:]
+
+                    while b"\r" in self.serial_buffer:
+                        raw_line, self.serial_buffer = self.serial_buffer.split(b"\r", 1)
+                        line = raw_line.decode("latin-1", errors="ignore").strip()
+                        if line:
+                            self.data_queue.put(("RAW", line))
+            except Exception:
+                self._close_port()
+
+            time.sleep(0.015)
+
+    def _close_port(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.data_queue.put(("STATUS", "DISCONNECTED", "#FF0033"))
+
+    def stop(self):
+        self.running = False
+        self._close_port()
+
+
 class USBRecordingEngine(threading.Thread):
     """Captures and filters audio via local ALSA/PulseAudio inputs."""
 
@@ -166,7 +288,7 @@ class USBRecordingEngine(threading.Thread):
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.terminate()
-                self.ffmpeg_proc.wait(timeout=3)
+                self.ffmpeg_proc.wait(timeout=2)
             except Exception:
                 try:
                     self.ffmpeg_proc.kill()
@@ -315,7 +437,7 @@ class RTSPAudioEngine(threading.Thread):
             try:
                 if self.ffmpeg_proc.stdin:
                     self.ffmpeg_proc.stdin.close()
-                self.ffmpeg_proc.wait(timeout=3)
+                self.ffmpeg_proc.wait(timeout=2)
             except Exception:
                 try:
                     self.ffmpeg_proc.kill()
@@ -338,7 +460,7 @@ class RTSPAudioEngine(threading.Thread):
 
 
 class VirtualScanner(tk.Tk):
-    """Main graphical user interface and serial polling engine for LinScan."""
+    """Main graphical user interface for LinScan."""
 
     def __init__(self):
         super().__init__()
@@ -349,10 +471,8 @@ class VirtualScanner(tk.Tk):
 
         self.lcd_font = tkfont.Font(family="Courier", size=17, weight="bold")
 
-        self.ser = None
         self.rtsp_engine = None
         self.usb_engine = None
-        self.serial_buffer = b""
 
         self.active_call = False
         self.record_enabled = False
@@ -369,7 +489,6 @@ class VirtualScanner(tk.Tk):
         self.log_dept = ScrollCatcher()
         self.log_chan = ScrollCatcher()
 
-        self.poll_counter = 0
         self.tg_hits = {}
         self.call_times = {}
         self.current_call_start = None
@@ -387,13 +506,16 @@ class VirtualScanner(tk.Tk):
         self._build_ui()
         self.load_ip()
 
+        # Thread-safe communication queue from serial worker
+        self.serial_queue = queue.Queue()
+        self.serial_manager = SerialManager(self.serial_queue)
+        self.serial_manager.start()
+
         self.bind_all("<Key>", self.handle_keypress)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        self.poll_connection()
-        self.poll_hardware_state()
-        self.request_data()
-        self.read_data()
+        # Process serial updates on UI loop
+        self.process_serial_queue()
 
     def _build_ui(self):
         """Construct the Tkinter interface components."""
@@ -662,12 +784,8 @@ class VirtualScanner(tk.Tk):
                 pass
 
     def toggle_sd_record(self):
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(b"KEY,F,P\r")
-                self.after(300, lambda: self.ser.write(b"KEY,Y,P\r"))
-            except OSError:
-                pass
+        self.serial_manager.send_cmd(b"KEY,F,P\r")
+        self.after(300, lambda: self.serial_manager.send_cmd(b"KEY,Y,P\r"))
 
     def toggle_usb_record(self):
         self.usb_record_enabled = not self.usb_record_enabled
@@ -681,7 +799,6 @@ class VirtualScanner(tk.Tk):
             self.usb_rec_btn.config(text="○ USB REC", fg="#888888")
             if self.usb_engine:
                 self.usb_engine.stop()
-                self.usb_engine.join(timeout=4.0)
                 self.usb_engine = None
 
     def toggle_wifi_record(self):
@@ -701,7 +818,6 @@ class VirtualScanner(tk.Tk):
             self.wifi_rec_btn.config(text="○ WIFI REC", fg="#888888")
             if self.rtsp_engine:
                 self.rtsp_engine.stop()
-                self.rtsp_engine.join(timeout=4.0)
                 self.rtsp_engine = None
 
     def commit_log(self):
@@ -786,12 +902,10 @@ class VirtualScanner(tk.Tk):
         self.usb_record_enabled = False
         if self.rtsp_engine:
             self.rtsp_engine.stop()
-            self.rtsp_engine.join(timeout=3.0)
         if self.usb_engine:
             self.usb_engine.stop()
-            self.usb_engine.join(timeout=3.0)
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        if self.serial_manager:
+            self.serial_manager.stop()
         self.destroy()
 
     def clear_log(self):
@@ -805,88 +919,32 @@ class VirtualScanner(tk.Tk):
         if now - self.last_key_time < 0.1:
             return
         self.last_key_time = now
-
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(f"KEY,{key_code},P\r".encode("ascii"))
-            except OSError:
-                pass
+        self.serial_manager.send_cmd(f"KEY,{key_code},P\r".encode("ascii"))
 
     def send_volume(self, val):
         if getattr(self, "_ignore_slider_events", False):
             return
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(f"VOL,{int(val):02d}\r".encode("ascii"))
-            except OSError:
-                pass
+        self.serial_manager.send_cmd(f"VOL,{int(val):02d}\r".encode("ascii"))
 
     def send_squelch(self, val):
         if getattr(self, "_ignore_slider_events", False):
             return
-        if self.ser and self.ser.is_open:
+        self.serial_manager.send_cmd(f"SQL,{int(val):02d}\r".encode("ascii"))
+
+    def process_serial_queue(self):
+        """Consume messages from the background serial manager thread."""
+        latest_sts = None
+
+        while not self.serial_queue.empty():
             try:
-                self.ser.write(f"SQL,{int(val):02d}\r".encode("ascii"))
-            except OSError:
-                pass
-
-    def poll_hardware_state(self):
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(b"VOL\rSQL\rCLC\r")
-            except OSError:
-                pass
-        self.after(1500, self.poll_hardware_state)
-
-    def poll_connection(self):
-        if not self.ser or not self.ser.is_open:
-            ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-            if not ports:
-                if self._last_status != "NO USB DETECTED":
-                    self.status_label.config(text="NO USB DETECTED", fg="#FF0033")
-                    self._last_status = "NO USB DETECTED"
-            else:
-                for p in ports:
-                    try:
-                        self.ser = serial.Serial(p, BAUD_RATE, timeout=0)
-                        self.serial_buffer = b""
-                        self.status_label.config(text=f"CONNECTED ({os.path.basename(p)})", fg="#39FF14")
-                        self._last_status = "CONNECTED"
-                        now = datetime.datetime.now()
-                        dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
-                        self.ser.write(f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r".encode("ascii"))
-                        break
-                    except Exception:
-                        pass
-        self.after(2000, self.poll_connection)
-
-    def request_data(self):
-        if self.ser and self.ser.is_open:
-            try:
-                self.poll_counter += 1
-                if self.poll_counter % 15 == 5:
-                    self.ser.write(b"VOL\r")
-                elif self.poll_counter % 15 == 10:
-                    self.ser.write(b"SQL\r")
-                else:
-                    self.ser.write(b"STS\r")
-            except Exception:
-                if self.ser:
-                    self.ser.close()
-        self.after(150, self.request_data)
-
-    def read_data(self):
-        if self.ser and self.ser.is_open:
-            try:
-                if self.ser.in_waiting:
-                    self.serial_buffer += self.ser.read(self.ser.in_waiting)
-
-                latest_sts = None
-
-                while b"\r" in self.serial_buffer:
-                    raw_line, self.serial_buffer = self.serial_buffer.split(b"\r", 1)
-                    line = raw_line.decode("latin-1", errors="ignore").strip()
-
+                msg_type, payload = self.serial_queue.get_nowait()
+                if msg_type == "STATUS":
+                    text, color = payload, "#39FF14"
+                    if isinstance(payload, tuple) or len(payload) == 2:
+                        text, color = payload[0], payload[1]
+                    self.status_label.config(text=text, fg=color)
+                elif msg_type == "RAW":
+                    line = payload
                     if line.startswith("STS,"):
                         latest_sts = line
                     elif line.startswith("VOL,"):
@@ -914,17 +972,16 @@ class VirtualScanner(tk.Tk):
                                 self.cc_indicator.config(text="\u2B24 CC: DND", fg="#FFFF00")
                         except Exception:
                             pass
+            except queue.Empty:
+                break
 
-                if latest_sts:
-                    self.update_display(latest_sts)
+        if latest_sts:
+            self.update_display(latest_sts)
 
-            except Exception:
-                if self.ser:
-                    self.ser.close()
-        self.after(20, self.read_data)
+        self.after(20, self.process_serial_queue)
 
-    def is_numeric_or_empty(self, s):
-        """Utility function to allow empty signals to pass validation."""
+    def is_numeric_or_empty(self, s: str) -> bool:
+        """Utility function to validate signal/register integers."""
         return s == "" or s.isdigit()
 
     def update_display(self, line: str):
@@ -963,9 +1020,9 @@ class VirtualScanner(tk.Tk):
                 if (
                     f_sq in ["0", "1"]
                     and f_mute in ["0", "1"]
-                    and (f_vol == "" or f_vol.isdigit())
-                    and (f_sql == "" or f_sql.isdigit())
-                    and (f_sig == "" or f_sig.isdigit())
+                    and self.is_numeric_or_empty(f_vol)
+                    and self.is_numeric_or_empty(f_sql)
+                    and self.is_numeric_or_empty(f_sig)
                 ):
                     hw_idx = i
                     break
