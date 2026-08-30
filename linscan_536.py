@@ -10,6 +10,7 @@ License: MIT
 import csv
 import datetime
 import glob
+import json
 import os
 import queue
 import re
@@ -495,14 +496,16 @@ class VirtualScanner(tk.Tk):
         self.lcd_colors = ["#C0C0C0", "#FFA500", "#39FF14", "#00FFFF", "#FFB6C1", "#ADD8E6"]
         self.current_color_idx = 0
 
-        self.ip_file = os.path.expanduser("~/linscan_ip.txt")
+        self.config_dir = os.path.expanduser("~/.config/linscan")
+        self.config_file = os.path.join(self.config_dir, "config.json")
+
         self._last_sig = ""
         self._last_sig_color = ""
         self._last_scan_state = None
         self._last_bg_size = None
 
+        self.load_config()
         self._build_ui()
-        self.load_ip()
 
         self.serial_queue = queue.Queue()
         self.serial_manager = SerialManager(self.serial_queue)
@@ -512,6 +515,52 @@ class VirtualScanner(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.process_serial_queue()
+        
+        # Ensure correct background color is applied immediately on boot
+        self.update_idletasks()
+        self.draw_background()
+
+    def load_config(self):
+        """Load configuration from JSON, explicitly logging any failures."""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    self.scanner_ip = config.get("scanner_ip", "")
+                    
+                    # Strictly cast to int and ensure it is within the bounds of our color list
+                    loaded_color = int(config.get("lcd_color_idx", 0))
+                    self.current_color_idx = loaded_color % len(self.lcd_colors)
+                    
+                    print(f"LinScan Config Loaded -> IP: '{self.scanner_ip}', LCD Color Index: {self.current_color_idx}")
+            except Exception as e:
+                print(f"LinScan Warning: Failed to parse {self.config_file}: {e}")
+        else:
+            print("LinScan: No existing config.json found. Checking for legacy ip txt file...")
+            legacy_file = os.path.expanduser("~/linscan_ip.txt")
+            if os.path.exists(legacy_file):
+                try:
+                    with open(legacy_file, "r", encoding="utf-8") as f:
+                        self.scanner_ip = f.read().strip()
+                    os.remove(legacy_file)
+                    print(f"LinScan: Migrated legacy IP {self.scanner_ip} and removed txt file.")
+                except Exception as e:
+                    print(f"LinScan Warning: Legacy file migration failed: {e}")
+            self.save_config()
+
+    def save_config(self):
+        """Save settings persistently to JSON."""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            config = {
+                "scanner_ip": self.scanner_ip,
+                "lcd_color_idx": self.current_color_idx
+            }
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4)
+            print(f"LinScan Config Saved -> IP: '{self.scanner_ip}', LCD Color Index: {self.current_color_idx}")
+        except Exception as e:
+            print(f"LinScan Error: Failed to write to {self.config_file}: {e}")
 
     def _build_ui(self):
         """Construct the Tkinter interface components."""
@@ -713,6 +762,7 @@ class VirtualScanner(tk.Tk):
 
     def cycle_lcd_color(self):
         self.current_color_idx = (self.current_color_idx + 1) % len(self.lcd_colors)
+        self.save_config()
         self.draw_background()
 
     def handle_keypress(self, event):
@@ -758,14 +808,6 @@ class VirtualScanner(tk.Tk):
                 for item in items:
                     writer.writerow(self.log_tree.item(item)["values"])
 
-    def load_ip(self):
-        if os.path.exists(self.ip_file):
-            try:
-                with open(self.ip_file, "r", encoding="utf-8") as f:
-                    self.scanner_ip = f.read().strip()
-            except OSError:
-                pass
-
     def set_ip(self):
         new_ip = simpledialog.askstring(
             "Scanner IP", "Enter Uniden Wi-Fi IP Address:\n(e.g., 192.168.1.15)",
@@ -773,11 +815,7 @@ class VirtualScanner(tk.Tk):
         )
         if new_ip and new_ip.strip():
             self.scanner_ip = new_ip.strip()
-            try:
-                with open(self.ip_file, "w", encoding="utf-8") as f:
-                    f.write(self.scanner_ip)
-            except OSError:
-                pass
+            self.save_config()
 
     def toggle_sd_record(self):
         self.serial_manager.send_cmd(b"KEY,F,P\r")
@@ -894,6 +932,8 @@ class VirtualScanner(tk.Tk):
                 pass
 
     def on_closing(self):
+        # Ensure configurations are saved upon window close
+        self.save_config()
         self.record_enabled = False
         self.usb_record_enabled = False
         if self.rtsp_engine:
