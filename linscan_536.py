@@ -11,7 +11,8 @@ import csv
 import datetime
 import glob
 import json
-import os
+import logging
+from pathlib import Path
 import queue
 import re
 import socket
@@ -20,11 +21,24 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, simpledialog, ttk
+from tkinter import filedialog, ttk
 
 import serial
 
 BAUD_RATE = 115200
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+CONFIG_DIR = Path.home() / ".config" / "linscan"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = CONFIG_DIR / "linscan.log"
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 
 def clean_text_for_log(text: str) -> str:
@@ -43,7 +57,7 @@ def is_status_line(text: str) -> bool:
     if not clean_upper or len(clean_upper) <= 1:
         return True
 
-    if clean_upper.startswith(("F0:", "S0:", "UID:", "UID ", "TGID:", "TGID ")):
+    if clean_upper.startswith(("F0:", "S0:")):
         return True
 
     status_prefixes = (
@@ -128,7 +142,7 @@ class SerialManager(threading.Thread):
         super().__init__(daemon=True)
         self.data_queue = data_queue
         self.cmd_queue = queue.Queue()
-        self.running = True
+        self.stop_event = threading.Event()
         self.ser = None
         self.serial_buffer = b""
 
@@ -141,7 +155,7 @@ class SerialManager(threading.Thread):
         hw_timer = 0.0
         poll_cycle = 0
 
-        while self.running:
+        while not self.stop_event.is_set():
             # 1. Connection check / Reconnect
             if not self.ser or not self.ser.is_open:
                 ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
@@ -154,13 +168,14 @@ class SerialManager(threading.Thread):
                     try:
                         self.ser = serial.Serial(p, BAUD_RATE, timeout=0.1, write_timeout=0.2)
                         self.serial_buffer = b""
-                        self.data_queue.put(("STATUS", (f"CONNECTED ({os.path.basename(p)})", "#39FF14")))
+                        self.data_queue.put(("STATUS", (f"CONNECTED ({Path(p).name})", "#39FF14")))
                         now = datetime.datetime.now()
                         dst_flag = 1 if time.localtime().tm_isdst > 0 else 0
                         dtm_cmd = f"DTM,{dst_flag},{now.strftime('%Y,%m,%d,%H,%M,%S')}\r".encode("ascii")
                         self.ser.write(dtm_cmd)
                         break
-                    except Exception:
+                    except Exception as err:
+                        logging.warning("Serial connection attempt failed on %s: %s", p, err)
                         self.ser = None
 
                 if not self.ser:
@@ -173,7 +188,8 @@ class SerialManager(threading.Thread):
                     cmd = self.cmd_queue.get_nowait()
                     if self.ser and self.ser.is_open:
                         self.ser.write(cmd)
-                except Exception:
+                except Exception as err:
+                    logging.error("Serial command write failed: %s", err)
                     self._close_port()
                     break
 
@@ -193,7 +209,8 @@ class SerialManager(threading.Thread):
                         self.ser.write(b"SQL\r")
                     else:
                         self.ser.write(b"STS\r")
-                except Exception:
+                except Exception as err:
+                    logging.warning("Serial poll write error: %s", err)
                     self._close_port()
                     continue
 
@@ -201,7 +218,8 @@ class SerialManager(threading.Thread):
                 hw_timer = now
                 try:
                     self.ser.write(b"VOL\rSQL\rCLC\r")
-                except Exception:
+                except Exception as err:
+                    logging.warning("Serial hardware query error: %s", err)
                     self._close_port()
                     continue
 
@@ -219,7 +237,8 @@ class SerialManager(threading.Thread):
                         line = raw_line.decode("latin-1", errors="ignore").strip()
                         if line:
                             self.data_queue.put(("RAW", line))
-            except Exception:
+            except Exception as err:
+                logging.warning("Serial read error: %s", err)
                 self._close_port()
 
             time.sleep(0.015)
@@ -234,17 +253,17 @@ class SerialManager(threading.Thread):
         self.data_queue.put(("STATUS", ("DISCONNECTED", "#FF0033")))
 
     def stop(self):
-        self.running = False
+        self.stop_event.set()
         self._close_port()
 
 
 class USBRecordingEngine(threading.Thread):
     """Captures and filters audio via local ALSA/PulseAudio inputs."""
 
-    def __init__(self, mp3_file: str):
+    def __init__(self, mp3_path: Path):
         super().__init__(daemon=True)
-        self.mp3_file = mp3_file
-        self.running = True
+        self.mp3_path = mp3_path
+        self.stop_event = threading.Event()
         self.ffmpeg_proc = None
         self.start_time = datetime.datetime.now()
 
@@ -256,7 +275,7 @@ class USBRecordingEngine(threading.Thread):
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
             "-f", "pulse", "-i", "default",
             "-af", f"aresample=async=1,{vox_filter},{norm_filter}",
-            "-c:a", "libmp3lame", "-b:a", "64k", self.mp3_file
+            "-c:a", "libmp3lame", "-b:a", "64k", str(self.mp3_path)
         ]
 
         try:
@@ -264,15 +283,15 @@ class USBRecordingEngine(threading.Thread):
                 ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
             )
             self._monitor_recording()
-        except OSError:
-            pass
+        except OSError as err:
+            logging.error("Failed to start USB recording process: %s", err)
 
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr:
             return
         buf = ""
         try:
-            while self.running:
+            while not self.stop_event.is_set():
                 chunk = self.ffmpeg_proc.stderr.read(64)
                 if not chunk:
                     break
@@ -284,7 +303,7 @@ class USBRecordingEngine(threading.Thread):
             pass
 
     def stop(self):
-        self.running = False
+        self.stop_event.set()
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.terminate()
@@ -298,53 +317,59 @@ class USBRecordingEngine(threading.Thread):
         self.cleanup()
 
     def cleanup(self):
-        if os.path.exists(self.mp3_file):
+        if self.mp3_path.exists():
             try:
-                if os.path.getsize(self.mp3_file) < 20000:
-                    os.remove(self.mp3_file)
+                if self.mp3_path.stat().st_size < 20000:
+                    self.mp3_path.unlink()
                 else:
                     new_name = f"Session_USB_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
-                    new_path = os.path.join(os.path.dirname(self.mp3_file), new_name)
-                    if os.path.exists(new_path):
-                        os.remove(new_path)
-                    os.rename(self.mp3_file, new_path)
-            except OSError:
-                pass
+                    new_path = self.mp3_path.parent / new_name
+                    if new_path.exists():
+                        new_path.unlink()
+                    self.mp3_path.rename(new_path)
+            except OSError as err:
+                logging.warning("Error cleaning up USB recording file: %s", err)
 
 
 class RTSPAudioEngine(threading.Thread):
     """Extracts raw digital audio streams from the Uniden Wi-Fi dongle via RTSP."""
 
-    def __init__(self, scanner_ip: str, mp3_file: str):
+    def __init__(self, scanner_ip: str, mp3_path: Path):
         super().__init__(daemon=True)
         self.ip = scanner_ip
-        self.mp3_file = mp3_file
-        self.running = True
+        self.mp3_path = mp3_path
+        self.stop_event = threading.Event()
         self.tcp_sock = None
         self.udp_sock = None
         self.ffmpeg_proc = None
         self.start_time = datetime.datetime.now()
 
     def run(self):
-        audio_filter = "volume=3.0,silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,loudnorm=I=-16:TP=-1.5:LRA=11"
+        audio_filter = (
+            "volume=3.0,"
+            "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,"
+            "loudnorm=I=-16:TP=-1.5:LRA=11"
+        )
 
         ffmpeg_cmd = [
-            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
             "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0",
-            "-af", audio_filter, "-c:a", "libmp3lame", "-b:a", "64k", self.mp3_file
+            "-af", audio_filter, "-c:a", "libmp3lame", "-b:a", "64k", str(self.mp3_path)
         ]
         try:
             self.ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-        except OSError:
+        except OSError as err:
+            logging.error("Failed to start RTSP FFmpeg encoder: %s", err)
             return
 
-        while self.running:
+        while not self.stop_event.is_set():
             try:
                 self.connect_and_stream()
-            except Exception:
-                if self.running:
+            except Exception as err:
+                if not self.stop_event.is_set():
+                    logging.warning("RTSP streaming interrupted: %s. Reconnecting...", err)
                     self.close_sockets()
                     time.sleep(2)
         self.cleanup()
@@ -390,7 +415,7 @@ class RTSPAudioEngine(threading.Thread):
                 pass
 
         last_ping = time.time()
-        while self.running:
+        while not self.stop_event.is_set():
             if time.time() - last_ping > 10.0:
                 try:
                     self.tcp_sock.sendall(f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {session_id}\r\nUser-Agent: LinScan\r\n\r\n".encode())
@@ -402,19 +427,28 @@ class RTSPAudioEngine(threading.Thread):
 
             try:
                 data, _ = self.udp_sock.recvfrom(2048)
-                if len(data) > 12 and self.ffmpeg_proc and self.ffmpeg_proc.stdin:
-                    try:
-                        self.ffmpeg_proc.stdin.write(data[12:])
-                        self.ffmpeg_proc.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        break
+                if len(data) >= 12:
+                    cc = data[0] & 0x0F
+                    has_ext = bool(data[0] & 0x10)
+                    payload_offset = 12 + (cc * 4)
+
+                    if has_ext and len(data) >= payload_offset + 4:
+                        ext_words = int.from_bytes(data[payload_offset + 2:payload_offset + 4], "big")
+                        payload_offset += 4 + (ext_words * 4)
+
+                    if payload_offset < len(data) and self.ffmpeg_proc and self.ffmpeg_proc.stdin:
+                        try:
+                            self.ffmpeg_proc.stdin.write(data[payload_offset:])
+                            self.ffmpeg_proc.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            break
             except socket.timeout:
                 continue
 
         self.close_sockets()
 
     def stop(self):
-        self.running = False
+        self.stop_event.set()
         if self.tcp_sock:
             try:
                 self.tcp_sock.sendall(f"TEARDOWN rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: 99\r\nUser-Agent: LinScan\r\n\r\n".encode())
@@ -445,18 +479,18 @@ class RTSPAudioEngine(threading.Thread):
                     pass
             self.ffmpeg_proc = None
 
-        if os.path.exists(self.mp3_file):
+        if self.mp3_path.exists():
             try:
-                if os.path.getsize(self.mp3_file) < 20000:
-                    os.remove(self.mp3_file)
+                if self.mp3_path.stat().st_size < 20000:
+                    self.mp3_path.unlink()
                 else:
                     new_name = f"Session_VOX_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
-                    new_path = os.path.join(os.path.dirname(self.mp3_file), new_name)
-                    if os.path.exists(new_path):
-                        os.remove(new_path)
-                    os.rename(self.mp3_file, new_path)
-            except OSError:
-                pass
+                    new_path = self.mp3_path.parent / new_name
+                    if new_path.exists():
+                        new_path.unlink()
+                    self.mp3_path.rename(new_path)
+            except OSError as err:
+                logging.warning("Error finalizing RTSP recording: %s", err)
 
 
 class VirtualScanner(tk.Tk):
@@ -477,7 +511,6 @@ class VirtualScanner(tk.Tk):
         self.active_call = False
         self.record_enabled = False
         self.usb_record_enabled = False
-        self._ignore_slider_events = False
 
         self.current_uid = ""
         self.current_tgid = ""
@@ -496,8 +529,8 @@ class VirtualScanner(tk.Tk):
         self.lcd_colors = ["#C0C0C0", "#FFA500", "#39FF14", "#00FFFF", "#FFB6C1", "#ADD8E6"]
         self.current_color_idx = 0
 
-        self.config_dir = os.path.expanduser("~/.config/linscan")
-        self.config_file = os.path.join(self.config_dir, "config.json")
+        self.config_file = CONFIG_DIR / "config.json"
+        self.audio_dir = Path.home() / "LinScan_Audio"
 
         self._last_sig = ""
         self._last_sig_color = ""
@@ -515,52 +548,42 @@ class VirtualScanner(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.process_serial_queue()
-        
-        # Ensure correct background color is applied immediately on boot
         self.update_idletasks()
         self.draw_background()
 
     def load_config(self):
-        """Load configuration from JSON, explicitly logging any failures."""
-        if os.path.exists(self.config_file):
+        """Load configuration from JSON, migrating legacy settings if needed."""
+        if self.config_file.exists():
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     self.scanner_ip = config.get("scanner_ip", "")
-                    
-                    # Strictly cast to int and ensure it is within the bounds of our color list
                     loaded_color = int(config.get("lcd_color_idx", 0))
                     self.current_color_idx = loaded_color % len(self.lcd_colors)
-                    
-                    print(f"LinScan Config Loaded -> IP: '{self.scanner_ip}', LCD Color Index: {self.current_color_idx}")
             except Exception as e:
-                print(f"LinScan Warning: Failed to parse {self.config_file}: {e}")
+                logging.warning("Failed to parse config file: %s", e)
         else:
-            print("LinScan: No existing config.json found. Checking for legacy ip txt file...")
-            legacy_file = os.path.expanduser("~/linscan_ip.txt")
-            if os.path.exists(legacy_file):
+            legacy_file = Path.home() / "linscan_ip.txt"
+            if legacy_file.exists():
                 try:
                     with open(legacy_file, "r", encoding="utf-8") as f:
                         self.scanner_ip = f.read().strip()
-                    os.remove(legacy_file)
-                    print(f"LinScan: Migrated legacy IP {self.scanner_ip} and removed txt file.")
+                    legacy_file.unlink()
                 except Exception as e:
-                    print(f"LinScan Warning: Legacy file migration failed: {e}")
+                    logging.warning("Legacy file migration failed: %s", e)
             self.save_config()
 
     def save_config(self):
         """Save settings persistently to JSON."""
         try:
-            os.makedirs(self.config_dir, exist_ok=True)
             config = {
                 "scanner_ip": self.scanner_ip,
                 "lcd_color_idx": self.current_color_idx
             }
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4)
-            print(f"LinScan Config Saved -> IP: '{self.scanner_ip}', LCD Color Index: {self.current_color_idx}")
         except Exception as e:
-            print(f"LinScan Error: Failed to write to {self.config_file}: {e}")
+            logging.error("Failed to write config file: %s", e)
 
     def _build_ui(self):
         """Construct the Tkinter interface components."""
@@ -573,7 +596,7 @@ class VirtualScanner(tk.Tk):
         self.vol_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
         self.vol_panel.pack(side=tk.LEFT, fill=tk.Y, padx=20, pady=20)
 
-        for name, to_val, cmd_func in [("VOL", 29, self.send_volume), ("SQL", 19, self.send_squelch)]:
+        for name, to_val in [("VOL", 29), ("SQL", 19)]:
             sub = tk.Frame(self.vol_panel, bg="#1a1a1a")
             sub.pack(side=tk.LEFT, padx=5)
             tk.Label(sub, text=name, fg="#888888", bg="#1a1a1a", font=("Arial", 11, "bold")).pack(pady=(0, 5))
@@ -581,13 +604,15 @@ class VirtualScanner(tk.Tk):
                 sub, from_=to_val, to=0, orient=tk.VERTICAL, bg="#111111",
                 fg="#39FF14" if name == "VOL" else "#00FFFF",
                 troughcolor="#050505", bd=1, highlightthickness=0, relief=tk.SUNKEN,
-                activebackground="#2a2a2a", command=cmd_func, length=180
+                activebackground="#2a2a2a", length=180
             )
             slider.pack(fill=tk.Y, expand=True)
             if name == "VOL":
                 self.vol_slider = slider
+                self.vol_slider.bind("<ButtonRelease-1>", lambda e: self.send_volume())
             else:
                 self.sql_slider = slider
+                self.sql_slider.bind("<ButtonRelease-1>", lambda e: self.send_squelch())
 
         self.keypad_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
         self.keypad_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=20, pady=20)
@@ -789,9 +814,8 @@ class VirtualScanner(tk.Tk):
             self.send_key(key)
 
     def open_audio_folder(self):
-        audio_dir = os.path.expanduser("~/LinScan_Audio")
-        os.makedirs(audio_dir, exist_ok=True)
-        subprocess.Popen(["xdg-open", audio_dir])
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["xdg-open", str(self.audio_dir)])
 
     def export_csv(self):
         items = self.log_tree.get_children()
@@ -809,13 +833,31 @@ class VirtualScanner(tk.Tk):
                     writer.writerow(self.log_tree.item(item)["values"])
 
     def set_ip(self):
-        new_ip = simpledialog.askstring(
-            "Scanner IP", "Enter Uniden Wi-Fi IP Address:\n(e.g., 192.168.1.15)",
-            initialvalue=self.scanner_ip, parent=self
-        )
-        if new_ip and new_ip.strip():
-            self.scanner_ip = new_ip.strip()
-            self.save_config()
+        top = tk.Toplevel(self)
+        top.title("Scanner IP")
+        top.geometry("340x150")
+        top.configure(bg="#1a1a1a")
+        top.resizable(False, False)
+        top.transient(self)
+
+        tk.Label(top, text="Enter Uniden Wi-Fi IP Address:\n(e.g., 192.168.1.15)", fg="#FFFFFF", bg="#1a1a1a", font=("Arial", 10, "bold")).pack(pady=10)
+        entry = tk.Entry(top, font=("Arial", 11), justify="center")
+        entry.insert(0, self.scanner_ip)
+        entry.pack(pady=5, padx=20, fill=tk.X)
+        entry.focus_set()
+
+        def save_and_close():
+            val = entry.get().strip()
+            if val:
+                self.scanner_ip = val
+                self.save_config()
+            top.destroy()
+
+        btn_f = tk.Frame(top, bg="#1a1a1a")
+        btn_f.pack(pady=10)
+        tk.Button(btn_f, text="Save", width=10, bg="#333333", fg="#39FF14", font=("Arial", 9, "bold"), command=save_and_close).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_f, text="Cancel", width=10, bg="#333333", fg="#FFFFFF", font=("Arial", 9, "bold"), command=top.destroy).pack(side=tk.LEFT, padx=5)
+        top.bind("<Return>", lambda e: save_and_close())
 
     def toggle_sd_record(self):
         self.serial_manager.send_cmd(b"KEY,F,P\r")
@@ -825,9 +867,9 @@ class VirtualScanner(tk.Tk):
         self.usb_record_enabled = not self.usb_record_enabled
         if self.usb_record_enabled:
             self.usb_rec_btn.config(text="● USB REC", fg="#FF0000")
-            os.makedirs(os.path.expanduser("~/LinScan_Audio"), exist_ok=True)
-            mp3_file = os.path.expanduser(f"~/LinScan_Audio/Session_USB_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3")
-            self.usb_engine = USBRecordingEngine(mp3_file)
+            self.audio_dir.mkdir(parents=True, exist_ok=True)
+            mp3_path = self.audio_dir / f"Session_USB_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3"
+            self.usb_engine = USBRecordingEngine(mp3_path)
             self.usb_engine.start()
         else:
             self.usb_rec_btn.config(text="○ USB REC", fg="#888888")
@@ -844,9 +886,9 @@ class VirtualScanner(tk.Tk):
         self.record_enabled = not self.record_enabled
         if self.record_enabled:
             self.wifi_rec_btn.config(text="● WIFI REC", fg="#FF0000")
-            os.makedirs(os.path.expanduser("~/LinScan_Audio"), exist_ok=True)
-            vox_file = os.path.expanduser(f"~/LinScan_Audio/Session_VOX_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3")
-            self.rtsp_engine = RTSPAudioEngine(self.scanner_ip, vox_file)
+            self.audio_dir.mkdir(parents=True, exist_ok=True)
+            vox_path = self.audio_dir / f"Session_VOX_{datetime.datetime.now().strftime('%Y-%m-%d_%I-%M-%S%p')}.mp3"
+            self.rtsp_engine = RTSPAudioEngine(self.scanner_ip, vox_path)
             self.rtsp_engine.start()
         else:
             self.wifi_rec_btn.config(text="○ WIFI REC", fg="#888888")
@@ -855,7 +897,6 @@ class VirtualScanner(tk.Tk):
                 self.rtsp_engine = None
 
     def commit_log(self):
-        """Finalize transmission data and insert a validated row into the Activity GUI table."""
         sys_final = clean_text_for_log(self.log_sys.full_text).strip()
         dept_final = clean_text_for_log(self.log_dept.full_text).strip()
         chan_final = clean_text_for_log(self.log_chan.full_text).strip()
@@ -925,14 +966,10 @@ class VirtualScanner(tk.Tk):
                 self.log_tree.move(tg_key, "", 0)
             else:
                 self.log_tree.insert("", 0, iid=tg_key, values=row_vals, tags=(row_tag,))
-        except Exception:
-            try:
-                self.log_tree.insert("", 0, values=row_vals, tags=(row_tag,))
-            except Exception:
-                pass
+        except Exception as e:
+            logging.warning("Error writing row to activity log: %s", e)
 
     def on_closing(self):
-        # Ensure configurations are saved upon window close
         self.save_config()
         self.record_enabled = False
         self.usb_record_enabled = False
@@ -957,18 +994,15 @@ class VirtualScanner(tk.Tk):
         self.last_key_time = now
         self.serial_manager.send_cmd(f"KEY,{key_code},P\r".encode("ascii"))
 
-    def send_volume(self, val):
-        if getattr(self, "_ignore_slider_events", False):
-            return
-        self.serial_manager.send_cmd(f"VOL,{int(val):02d}\r".encode("ascii"))
+    def send_volume(self):
+        val = int(self.vol_slider.get())
+        self.serial_manager.send_cmd(f"VOL,{val:02d}\r".encode("ascii"))
 
-    def send_squelch(self, val):
-        if getattr(self, "_ignore_slider_events", False):
-            return
-        self.serial_manager.send_cmd(f"SQL,{int(val):02d}\r".encode("ascii"))
+    def send_squelch(self):
+        val = int(self.sql_slider.get())
+        self.serial_manager.send_cmd(f"SQL,{val:02d}\r".encode("ascii"))
 
     def process_serial_queue(self):
-        """Consume messages from the background serial manager thread."""
         latest_sts = None
 
         while not self.serial_queue.empty():
@@ -986,16 +1020,12 @@ class VirtualScanner(tk.Tk):
                         latest_sts = line
                     elif line.startswith("VOL,"):
                         try:
-                            self._ignore_slider_events = True
                             self.vol_slider.set(int(line.split(",")[1]))
-                            self._ignore_slider_events = False
                         except Exception:
                             pass
                     elif line.startswith("SQL,"):
                         try:
-                            self._ignore_slider_events = True
                             self.sql_slider.set(int(line.split(",")[1]))
-                            self._ignore_slider_events = False
                         except Exception:
                             pass
                     elif line.startswith("CLC,"):
@@ -1018,11 +1048,9 @@ class VirtualScanner(tk.Tk):
         self.after(20, self.process_serial_queue)
 
     def is_numeric_or_empty(self, s: str) -> bool:
-        """Utility function to validate signal/register integers."""
         return s == "" or s.isdigit()
 
     def update_display(self, line: str):
-        """Parse the Uniden serial payload and refresh LCD and activity logger states."""
         try:
             line = line.strip("\r\n\x00")
             if not line.startswith("STS,"):
@@ -1133,13 +1161,19 @@ class VirtualScanner(tk.Tk):
                 if self.active_call:
                     self.commit_log()
             else:
+                l2 = clean_text_for_log(raw_lines[1]).replace(">", "").replace("▶", "").strip() if len(raw_lines) > 1 else ""
                 l3 = clean_text_for_log(raw_lines[2]).replace(">", "").replace("▶", "").strip() if len(raw_lines) > 2 else ""
                 l4 = clean_text_for_log(raw_lines[3]).replace(">", "").replace("▶", "").strip() if len(raw_lines) > 3 else ""
                 l5 = clean_text_for_log(raw_lines[4]).replace(">", "").replace("▶", "").strip() if len(raw_lines) > 4 else ""
                 l6 = clean_text_for_log(raw_lines[5]).replace(">", "").replace("▶", "").strip() if len(raw_lines) > 5 else ""
 
+                u4 = l4.upper()
                 u5 = l5.upper()
-                is_trunked_search = any(u5.startswith(p) for p in ("ID SEARCH", "ID SCAN", "LINK", "FIND", "UID:", "UID ", "TGID:", "TGID "))
+                u6 = l6.upper()
+
+                is_trunked_search = any(u5.startswith(p) for p in ("ID SEARCH", "ID SCAN", "LINK", "FIND"))
+                is_l6_uid = u6.startswith(("UID:", "UID "))
+                is_l5_uid = u5.startswith(("UID:", "UID "))
 
                 is_call_active = False
                 call_sys, call_dept, call_chan = "", "", ""
@@ -1148,10 +1182,24 @@ class VirtualScanner(tk.Tk):
                     if l6 and not is_status_line(l6):
                         is_call_active = True
                         call_sys, call_dept, call_chan = l3, l4, l6
-                else:
-                    if l6 and not is_status_line(l6) and l5 and not is_status_line(l5):
+                elif is_l6_uid:
+                    if l5 and not is_status_line(l5):
                         is_call_active = True
                         call_sys, call_dept, call_chan = l3, l4, l5
+                elif is_l5_uid:
+                    if l4 and not is_status_line(l4):
+                        is_call_active = True
+                        call_sys, call_dept, call_chan = l2 or l3, l3, l4
+                else:
+                    if l5 and not is_status_line(l5):
+                        is_call_active = True
+                        call_sys, call_dept, call_chan = l3, l4, l5
+                    elif l6 and not is_status_line(l6):
+                        is_call_active = True
+                        call_sys, call_dept, call_chan = l3, l4, l6
+
+                if self.active_call and uid_raw:
+                    self.current_uid = uid_raw
 
                 if is_call_active:
                     if not self.active_call:
@@ -1185,8 +1233,8 @@ class VirtualScanner(tk.Tk):
                 self.sig_label.config(text=sig_text, fg=current_sig_color)
                 self._last_sig, self._last_sig_color = sig_text, current_sig_color
 
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("Error processing display update: %s", e)
 
 
 if __name__ == "__main__":
