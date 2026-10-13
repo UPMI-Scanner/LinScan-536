@@ -12,33 +12,74 @@ import datetime
 import glob
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import serial
+from serial.tools import list_ports
 
 BAUD_RATE = 115200
+MAX_LOG_ROWS = 1000
+
+# Pre-compiled regular expressions for real-time STS parsing and RTSP headers
+UID_REGEX = re.compile(r"UID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", re.IGNORECASE)
+TGID_REGEX = re.compile(r"TGID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", re.IGNORECASE)
+NUM_REGEX = re.compile(r"\d+")
+FMT_REGEX = re.compile(r"^[0-9Rr* ]+$")
+SESSION_REGEX = re.compile(r"Session:\s*([^\r\n;]+)", re.IGNORECASE)
+SERVER_PORT_REGEX = re.compile(r"server_port=\s*([0-9]+)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
-# Logging Configuration
+# Logging Configuration (Bounded via RotatingFileHandler)
 # ---------------------------------------------------------------------------
 CONFIG_DIR = Path.home() / ".config" / "linscan"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = CONFIG_DIR / "linscan.log"
 
+log_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8"
+)
 logging.basicConfig(
-    filename=LOG_FILE,
+    handlers=[log_handler],
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+
+def find_uniden_ports() -> list[str]:
+    """
+    Prioritize Uniden USB Vendor ID (0x1965) or CDC ACM ports over generic ttyUSB
+    to avoid hijacking other connected serial peripherals.
+    """
+    uniden_ports = []
+    acm_ports = []
+    other_ports = []
+
+    try:
+        for port in list_ports.comports():
+            if port.vid == 0x1965 or "UNIDEN" in (port.manufacturer or "").upper():
+                uniden_ports.append(port.device)
+            elif "ttyACM" in port.device:
+                acm_ports.append(port.device)
+            elif "ttyUSB" in port.device:
+                other_ports.append(port.device)
+    except Exception as err:
+        logging.warning("Port enumeration via list_ports failed: %s", err)
+
+    discovered = uniden_ports + sorted(acm_ports) + sorted(other_ports)
+    if not discovered:
+        discovered = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    return discovered
 
 
 def clean_text_for_log(text: str) -> str:
@@ -152,13 +193,12 @@ class SerialManager(threading.Thread):
 
     def run(self):
         poll_timer = 0.0
-        hw_timer = 0.0
         poll_cycle = 0
 
         while not self.stop_event.is_set():
             # 1. Connection check / Reconnect
             if not self.ser or not self.ser.is_open:
-                ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+                ports = find_uniden_ports()
                 if not ports:
                     self.data_queue.put(("STATUS", ("NO USB DETECTED", "#FF0033")))
                     time.sleep(1.5)
@@ -198,28 +238,21 @@ class SerialManager(threading.Thread):
 
             now = time.time()
 
-            # 3. Scheduled polling
+            # 3. Unified scheduled polling (VOL, SQL, CLC, STS)
             if now - poll_timer >= 0.15:
                 poll_timer = now
-                poll_cycle += 1
+                poll_cycle = (poll_cycle + 1) % 15
                 try:
-                    if poll_cycle % 15 == 5:
+                    if poll_cycle == 5:
                         self.ser.write(b"VOL\r")
-                    elif poll_cycle % 15 == 10:
+                    elif poll_cycle == 10:
                         self.ser.write(b"SQL\r")
+                    elif poll_cycle == 0:
+                        self.ser.write(b"CLC\r")
                     else:
                         self.ser.write(b"STS\r")
                 except Exception as err:
                     logging.warning("Serial poll write error: %s", err)
-                    self._close_port()
-                    continue
-
-            if now - hw_timer >= 2.0:
-                hw_timer = now
-                try:
-                    self.ser.write(b"VOL\rSQL\rCLC\r")
-                except Exception as err:
-                    logging.warning("Serial hardware query error: %s", err)
                     self._close_port()
                     continue
 
@@ -243,6 +276,8 @@ class SerialManager(threading.Thread):
 
             time.sleep(0.015)
 
+        self._close_port()
+
     def _close_port(self):
         if self.ser:
             try:
@@ -254,7 +289,8 @@ class SerialManager(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
-        self._close_port()
+        if self.is_alive():
+            self.join(timeout=1.5)
 
 
 class USBRecordingEngine(threading.Thread):
@@ -268,11 +304,15 @@ class USBRecordingEngine(threading.Thread):
         self.start_time = datetime.datetime.now()
 
     def run(self):
-        vox_filter = "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB:stop_periods=-1:stop_duration=2:stop_threshold=-45dB"
-        norm_filter = "loudnorm=I=-16:TP=-1.5:LRA=11"
+        vox_filter = (
+            "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB:"
+            "stop_periods=-1:stop_duration=2:stop_threshold=-45dB"
+        )
+        # Real-time dynamic normalizer tailored for voice dispatch
+        norm_filter = "dynaudnorm=f=150:g=15"
 
         ffmpeg_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
             "-f", "pulse", "-i", "default",
             "-af", f"aresample=async=1,{vox_filter},{norm_filter}",
             "-c:a", "libmp3lame", "-b:a", "64k", str(self.mp3_path)
@@ -285,6 +325,8 @@ class USBRecordingEngine(threading.Thread):
             self._monitor_recording()
         except OSError as err:
             logging.error("Failed to start USB recording process: %s", err)
+        finally:
+            self.cleanup()
 
     def _monitor_recording(self):
         if not self.ffmpeg_proc or not self.ffmpeg_proc.stderr:
@@ -307,6 +349,14 @@ class USBRecordingEngine(threading.Thread):
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.terminate()
+            except Exception:
+                pass
+        if self.is_alive():
+            self.join(timeout=3.0)
+
+    def cleanup(self):
+        if self.ffmpeg_proc:
+            try:
                 self.ffmpeg_proc.wait(timeout=2)
             except Exception:
                 try:
@@ -314,15 +364,16 @@ class USBRecordingEngine(threading.Thread):
                 except Exception:
                     pass
             self.ffmpeg_proc = None
-        self.cleanup()
 
-    def cleanup(self):
         if self.mp3_path.exists():
             try:
                 if self.mp3_path.stat().st_size < 20000:
                     self.mp3_path.unlink()
                 else:
-                    new_name = f"Session_USB_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    new_name = (
+                        f"Session_USB_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}"
+                        f"_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    )
                     new_path = self.mp3_path.parent / new_name
                     if new_path.exists():
                         new_path.unlink()
@@ -347,8 +398,9 @@ class RTSPAudioEngine(threading.Thread):
     def run(self):
         audio_filter = (
             "volume=3.0,"
-            "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11"
+            "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB:"
+            "stop_periods=-1:stop_duration=1.0:stop_threshold=-42dB,"
+            "dynaudnorm=f=150:g=15"
         )
 
         ffmpeg_cmd = [
@@ -400,10 +452,16 @@ class RTSPAudioEngine(threading.Thread):
         resp = self.tcp_sock.recv(1024).decode(errors="ignore")
         cseq += 1
 
-        session_id = (re.search(r"Session:\s*([^\r\n;]+)", resp, re.IGNORECASE) or [None, ""])[1].strip()
-        server_port = int((re.search(r"server_port=\s*([0-9]+)", resp, re.IGNORECASE) or [None, 5004])[1])
+        sess_match = SESSION_REGEX.search(resp)
+        session_id = sess_match.group(1).strip() if sess_match else ""
 
-        req = f"PLAY rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: LinScan\r\nSession: {session_id}\r\nRange: npt=0.000-\r\n\r\n"
+        port_match = SERVER_PORT_REGEX.search(resp)
+        server_port = int(port_match.group(1)) if port_match else 5004
+
+        req = (
+            f"PLAY rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\n"
+            f"CSeq: {cseq}\r\nUser-Agent: LinScan\r\nSession: {session_id}\r\nRange: npt=0.000-\r\n\r\n"
+        )
         self.tcp_sock.sendall(req.encode())
         self.tcp_sock.recv(1024)
         cseq += 1
@@ -418,7 +476,11 @@ class RTSPAudioEngine(threading.Thread):
         while not self.stop_event.is_set():
             if time.time() - last_ping > 10.0:
                 try:
-                    self.tcp_sock.sendall(f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {session_id}\r\nUser-Agent: LinScan\r\n\r\n".encode())
+                    ping_req = (
+                        f"OPTIONS rtsp://{self.ip}/au:scanner.au RTSP/1.0\r\n"
+                        f"CSeq: {cseq}\r\nSession: {session_id}\r\nUser-Agent: LinScan\r\n\r\n"
+                    )
+                    self.tcp_sock.sendall(ping_req.encode())
                     self.tcp_sock.recv(512)
                     cseq += 1
                 except OSError:
@@ -451,10 +513,13 @@ class RTSPAudioEngine(threading.Thread):
         self.stop_event.set()
         if self.tcp_sock:
             try:
-                self.tcp_sock.sendall(f"TEARDOWN rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: 99\r\nUser-Agent: LinScan\r\n\r\n".encode())
+                self.tcp_sock.sendall(
+                    f"TEARDOWN rtsp://{self.ip}/au:scanner.au/ RTSP/1.0\r\nCSeq: 99\r\nUser-Agent: LinScan\r\n\r\n".encode()
+                )
             except OSError:
                 pass
-        self.close_sockets()
+        if self.is_alive():
+            self.join(timeout=3.0)
 
     def close_sockets(self):
         for sock in (self.tcp_sock, self.udp_sock):
@@ -484,7 +549,10 @@ class RTSPAudioEngine(threading.Thread):
                 if self.mp3_path.stat().st_size < 20000:
                     self.mp3_path.unlink()
                 else:
-                    new_name = f"Session_VOX_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    new_name = (
+                        f"Session_VOX_{self.start_time.strftime('%Y-%m-%d_%I-%M-%S%p')}"
+                        f"_to_{datetime.datetime.now().strftime('%I-%M-%S%p')}.mp3"
+                    )
                     new_path = self.mp3_path.parent / new_name
                     if new_path.exists():
                         new_path.unlink()
@@ -503,7 +571,14 @@ class VirtualScanner(tk.Tk):
         self.minsize(1050, 650)
         self.configure(bg="#050505")
 
-        self.lcd_font = tkfont.Font(family="Courier", size=17, weight="bold")
+        # Select clean anti-aliased fonts available on BunsenLabs / Debian
+        available_fonts = set(tkfont.families())
+        mono_family = "DejaVu Sans Mono" if "DejaVu Sans Mono" in available_fonts else "monospace"
+        sans_family = "DejaVu Sans" if "DejaVu Sans" in available_fonts else "sans-serif"
+
+        self.mono_family = mono_family
+        self.sans_family = sans_family
+        self.lcd_font = tkfont.Font(family=self.mono_family, size=17, weight="bold")
 
         self.rtsp_engine = None
         self.usb_engine = None
@@ -516,6 +591,12 @@ class VirtualScanner(tk.Tk):
         self.current_tgid = ""
         self.scanner_ip = ""
         self.last_key_time = 0.0
+
+        # Prevent serial poll updates from jumping sliders while user is dragging them
+        self.vol_dragging = False
+        self.sql_dragging = False
+        self.last_vol_change = 0.0
+        self.last_sql_change = 0.0
 
         self.catchers = [ScrollCatcher() for _ in range(16)]
         self.log_sys = ScrollCatcher()
@@ -536,6 +617,10 @@ class VirtualScanner(tk.Tk):
         self._last_sig_color = ""
         self._last_scan_state = None
         self._last_bg_size = None
+
+        self.has_ffmpeg = shutil.which("ffmpeg") is not None
+        if not self.has_ffmpeg:
+            logging.warning("FFmpeg not found in PATH. Audio recording features will be unavailable.")
 
         self.load_config()
         self._build_ui()
@@ -599,7 +684,10 @@ class VirtualScanner(tk.Tk):
         for name, to_val in [("VOL", 29), ("SQL", 19)]:
             sub = tk.Frame(self.vol_panel, bg="#1a1a1a")
             sub.pack(side=tk.LEFT, padx=5)
-            tk.Label(sub, text=name, fg="#888888", bg="#1a1a1a", font=("Arial", 11, "bold")).pack(pady=(0, 5))
+            tk.Label(
+                sub, text=name, fg="#888888", bg="#1a1a1a",
+                font=(self.sans_family, 11, "bold")
+            ).pack(pady=(0, 5))
             slider = tk.Scale(
                 sub, from_=to_val, to=0, orient=tk.VERTICAL, bg="#111111",
                 fg="#39FF14" if name == "VOL" else "#00FFFF",
@@ -609,9 +697,11 @@ class VirtualScanner(tk.Tk):
             slider.pack(fill=tk.Y, expand=True)
             if name == "VOL":
                 self.vol_slider = slider
+                self.vol_slider.bind("<ButtonPress-1>", lambda e: setattr(self, "vol_dragging", True))
                 self.vol_slider.bind("<ButtonRelease-1>", lambda e: self.send_volume())
             else:
                 self.sql_slider = slider
+                self.sql_slider.bind("<ButtonPress-1>", lambda e: setattr(self, "sql_dragging", True))
                 self.sql_slider.bind("<ButtonRelease-1>", lambda e: self.send_squelch())
 
         self.keypad_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
@@ -620,23 +710,32 @@ class VirtualScanner(tk.Tk):
         self.center_panel = tk.Frame(self.faceplate, bg="#1a1a1a")
         self.center_panel.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.knob = tk.Canvas(self.keypad_panel, width=100, height=100, bg="#1a1a1a", highlightthickness=0, cursor="hand2")
+        self.knob = tk.Canvas(
+            self.keypad_panel, width=100, height=100, bg="#1a1a1a",
+            highlightthickness=0, cursor="hand2"
+        )
         self.knob.pack(pady=(0, 15))
         self.knob.create_oval(5, 5, 95, 95, fill="#222222", outline="#111111")
         self.knob.create_oval(10, 10, 90, 90, fill="#777777", outline="#555555")
         self.knob.create_oval(20, 20, 80, 80, fill="#AAAAAA", outline="")
         self.knob.create_oval(30, 30, 70, 70, fill="#DDDDDD", outline="#888888")
-        self.knob.create_text(25, 50, text="◀", fill="#111111", font=("Arial", 14, "bold"))
-        self.knob.create_text(75, 50, text="▶", fill="#111111", font=("Arial", 14, "bold"))
-        self.knob.create_text(50, 50, text="PUSH\n[E]", fill="#111111", font=("Arial", 8, "bold"), justify="center")
+        self.knob.create_text(25, 50, text="◀", fill="#111111", font=(self.sans_family, 14, "bold"))
+        self.knob.create_text(75, 50, text="▶", fill="#111111", font=(self.sans_family, 14, "bold"))
+        self.knob.create_text(
+            50, 50, text="PUSH\n[E]", fill="#111111",
+            font=(self.sans_family, 8, "bold"), justify="center"
+        )
 
-        self.knob.bind("<Button-1>", lambda e: self.send_key("<") if e.x < 35 else (self.send_key(">") if e.x > 65 else self.send_key("E")))
+        self.knob.bind(
+            "<Button-1>",
+            lambda e: self.send_key("<") if e.x < 35 else (self.send_key(">") if e.x > 65 else self.send_key("E"))
+        )
         self.knob.bind("<Button-4>", lambda e: self.send_key("<"))
         self.knob.bind("<Button-5>", lambda e: self.send_key(">"))
         self.knob.bind("<MouseWheel>", lambda e: self.send_key("<") if e.delta > 0 else self.send_key(">"))
 
         btn_style = {
-            "font": ("Arial", 10, "bold"), "bg": "#111111", "fg": "#FFFFFF",
+            "font": (self.sans_family, 10, "bold"), "bg": "#111111", "fg": "#FFFFFF",
             "bd": 1, "activebackground": "#333333", "activeforeground": "#FFFFFF", "cursor": "hand2"
         }
         keypad_rows = [
@@ -659,12 +758,24 @@ class VirtualScanner(tk.Tk):
         self.lcd_header = tk.Frame(self.center_panel, bg="#1a1a1a")
         self.lcd_header.pack(fill=tk.X, padx=20, pady=(0, 5))
 
-        tk.Label(self.lcd_header, text="UNIDEN SCANNER", fg="#AAAAAA", bg="#1a1a1a", font=("Arial", 14, "bold")).pack(side=tk.LEFT)
-        self.status_label = tk.Label(self.lcd_header, text="CONNECTING...", fg="#39FF14", bg="#1a1a1a", font=("Courier", 14, "bold"))
+        tk.Label(
+            self.lcd_header, text="UNIDEN SCANNER", fg="#AAAAAA", bg="#1a1a1a",
+            font=(self.sans_family, 14, "bold")
+        ).pack(side=tk.LEFT)
+        self.status_label = tk.Label(
+            self.lcd_header, text="CONNECTING...", fg="#39FF14", bg="#1a1a1a",
+            font=(self.mono_family, 14, "bold")
+        )
         self.status_label.pack(side=tk.RIGHT)
-        self.sig_label = tk.Label(self.lcd_header, text="SIG: \u25a1 \u25a1 \u25a1 \u25a1 \u25a1", fg="#555555", bg="#1a1a1a", font=("Courier", 14, "bold"))
+        self.sig_label = tk.Label(
+            self.lcd_header, text="SIG: \u25a1 \u25a1 \u25a1 \u25a1 \u25a1", fg="#555555", bg="#1a1a1a",
+            font=(self.mono_family, 14, "bold")
+        )
         self.sig_label.pack(side=tk.RIGHT, padx=15)
-        self.cc_indicator = tk.Label(self.lcd_header, text="\u2B24 CC: OFF", fg="#555555", bg="#1a1a1a", font=("Arial", 14, "bold"))
+        self.cc_indicator = tk.Label(
+            self.lcd_header, text="\u2B24 CC: OFF", fg="#555555", bg="#1a1a1a",
+            font=(self.sans_family, 14, "bold")
+        )
         self.cc_indicator.pack(side=tk.RIGHT, padx=15)
 
         self.bezel = tk.Frame(self.center_panel, bg="#050505", highlightthickness=2, highlightbackground="#333333")
@@ -695,10 +806,10 @@ class VirtualScanner(tk.Tk):
         self.log_ctrl_frame.pack(fill=tk.X, pady=(0, 5))
         tk.Label(
             self.log_ctrl_frame, text="ACTIVITY TABLE (Double-click row to Hold Channel)",
-            fg="#00FFFF", bg="#050505", font=("Courier", 11, "bold")
+            fg="#00FFFF", bg="#050505", font=(self.mono_family, 11, "bold")
         ).pack(side=tk.LEFT)
 
-        btn_config = {"font": ("Arial", 9, "bold"), "bg": "#1a1a1a", "bd": 0, "cursor": "hand2"}
+        btn_config = {"font": (self.sans_family, 9, "bold"), "bg": "#1a1a1a", "bd": 0, "cursor": "hand2"}
         for txt, fg_col, cmd in [
             ("CLEAR LOG", "#00FFFF", self.clear_log),
             ("EXPORT CSV", "#39FF14", self.export_csv),
@@ -709,16 +820,28 @@ class VirtualScanner(tk.Tk):
         self.ip_btn = tk.Button(self.log_ctrl_frame, text="SET IP", fg="#FFFF00", command=self.set_ip, **btn_config)
         self.ip_btn.pack(side=tk.RIGHT, padx=4)
 
-        self.wifi_rec_btn = tk.Button(self.log_ctrl_frame, text="○ WIFI REC", fg="#888888", command=self.toggle_wifi_record, **btn_config)
+        self.wifi_rec_btn = tk.Button(
+            self.log_ctrl_frame, text="○ WIFI REC", fg="#888888",
+            command=self.toggle_wifi_record, **btn_config
+        )
         self.wifi_rec_btn.pack(side=tk.RIGHT, padx=4)
 
-        self.usb_rec_btn = tk.Button(self.log_ctrl_frame, text="○ USB REC", fg="#888888", command=self.toggle_usb_record, **btn_config)
+        self.usb_rec_btn = tk.Button(
+            self.log_ctrl_frame, text="○ USB REC", fg="#888888",
+            command=self.toggle_usb_record, **btn_config
+        )
         self.usb_rec_btn.pack(side=tk.RIGHT, padx=4)
 
-        self.sd_rec_btn = tk.Button(self.log_ctrl_frame, text="SD REC", fg="#FF0000", command=self.toggle_sd_record, **btn_config)
+        self.sd_rec_btn = tk.Button(
+            self.log_ctrl_frame, text="SD REC", fg="#FF0000",
+            command=self.toggle_sd_record, **btn_config
+        )
         self.sd_rec_btn.pack(side=tk.RIGHT, padx=4)
 
-        self.color_btn = tk.Button(self.log_ctrl_frame, text="LCD COLOR", fg="#FFFFFF", command=self.cycle_lcd_color, **btn_config)
+        self.color_btn = tk.Button(
+            self.log_ctrl_frame, text="LCD COLOR", fg="#FFFFFF",
+            command=self.cycle_lcd_color, **btn_config
+        )
         self.color_btn.pack(side=tk.RIGHT, padx=4)
 
         style = ttk.Style()
@@ -726,13 +849,19 @@ class VirtualScanner(tk.Tk):
 
         style.configure(
             "Treeview", background="#FFFFFF", foreground="#000000",
-            fieldbackground="#FFFFFF", rowheight=32, font=("Arial", 12, "bold")
+            fieldbackground="#FFFFFF", rowheight=32, font=(self.sans_family, 12, "bold")
         )
-        style.configure("Treeview.Heading", background="#D0D0D0", foreground="#000000", font=("Arial", 11, "bold"), relief="raised")
+        style.configure(
+            "Treeview.Heading", background="#D0D0D0", foreground="#000000",
+            font=(self.sans_family, 11, "bold"), relief="raised"
+        )
         style.map("Treeview", background=[("selected", "#0055FF")], foreground=[("selected", "#FFFFFF")])
 
         self.tree_columns = ("time", "sys", "dept", "chan", "tgid", "uid", "hits", "call_time")
-        self.log_tree = ttk.Treeview(self.software_panel, columns=self.tree_columns, show="headings", selectmode="browse")
+        self.log_tree = ttk.Treeview(
+            self.software_panel, columns=self.tree_columns,
+            show="headings", selectmode="browse"
+        )
 
         cols_config = [
             ("time", "LAST SEEN", 110, "center"),
@@ -749,7 +878,10 @@ class VirtualScanner(tk.Tk):
             self.log_tree.column(col_id, width=width, anchor=anchor)
 
         self.log_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.scrollbar = tk.Scrollbar(self.software_panel, command=self.log_tree.yview, bg="#1a1a1a", troughcolor="#050505", bd=0)
+        self.scrollbar = tk.Scrollbar(
+            self.software_panel, command=self.log_tree.yview,
+            bg="#1a1a1a", troughcolor="#050505", bd=0
+        )
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_tree.config(yscrollcommand=self.scrollbar.set)
 
@@ -791,6 +923,10 @@ class VirtualScanner(tk.Tk):
         self.draw_background()
 
     def handle_keypress(self, event):
+        # Do not intercept keystrokes when typing in an Entry field (e.g., SET IP modal)
+        if isinstance(event.widget, tk.Entry):
+            return
+
         sym = event.keysym
         key = event.char.lower()
         if sym in ("Up", "Left"):
@@ -810,12 +946,15 @@ class VirtualScanner(tk.Tk):
         }
         if key in key_map:
             self.send_key(key_map[key])
-        elif key in "0123456789.":
+        elif key and key in "0123456789.":
             self.send_key(key)
 
     def open_audio_folder(self):
         self.audio_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["xdg-open", str(self.audio_dir)])
+        try:
+            subprocess.Popen(["xdg-open", str(self.audio_dir)])
+        except OSError as err:
+            logging.error("Failed to open audio folder: %s", err)
 
     def export_csv(self):
         items = self.log_tree.get_children()
@@ -826,11 +965,14 @@ class VirtualScanner(tk.Tk):
             defaultextension=".csv", initialfile=default_name, filetypes=[("CSV Files", "*.csv")]
         )
         if out_path:
-            with open(out_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Last Seen", "System", "Department", "Channel", "TGID", "Last UID", "Hits", "Call Time"])
-                for item in items:
-                    writer.writerow(self.log_tree.item(item)["values"])
+            try:
+                with open(out_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Last Seen", "System", "Department", "Channel", "TGID", "Last UID", "Hits", "Call Time"])
+                    for item in items:
+                        writer.writerow(self.log_tree.item(item)["values"])
+            except OSError as err:
+                logging.error("CSV export failed: %s", err)
 
     def set_ip(self):
         top = tk.Toplevel(self)
@@ -840,8 +982,11 @@ class VirtualScanner(tk.Tk):
         top.resizable(False, False)
         top.transient(self)
 
-        tk.Label(top, text="Enter Uniden Wi-Fi IP Address:\n(e.g., 192.168.1.15)", fg="#FFFFFF", bg="#1a1a1a", font=("Arial", 10, "bold")).pack(pady=10)
-        entry = tk.Entry(top, font=("Arial", 11), justify="center")
+        tk.Label(
+            top, text="Enter Uniden Wi-Fi IP Address:\n(e.g., 192.168.1.15)",
+            fg="#FFFFFF", bg="#1a1a1a", font=(self.sans_family, 10, "bold")
+        ).pack(pady=10)
+        entry = tk.Entry(top, font=(self.sans_family, 11), justify="center")
         entry.insert(0, self.scanner_ip)
         entry.pack(pady=5, padx=20, fill=tk.X)
         entry.focus_set()
@@ -855,8 +1000,14 @@ class VirtualScanner(tk.Tk):
 
         btn_f = tk.Frame(top, bg="#1a1a1a")
         btn_f.pack(pady=10)
-        tk.Button(btn_f, text="Save", width=10, bg="#333333", fg="#39FF14", font=("Arial", 9, "bold"), command=save_and_close).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_f, text="Cancel", width=10, bg="#333333", fg="#FFFFFF", font=("Arial", 9, "bold"), command=top.destroy).pack(side=tk.LEFT, padx=5)
+        tk.Button(
+            btn_f, text="Save", width=10, bg="#333333", fg="#39FF14",
+            font=(self.sans_family, 9, "bold"), command=save_and_close
+        ).pack(side=tk.LEFT, padx=5)
+        tk.Button(
+            btn_f, text="Cancel", width=10, bg="#333333", fg="#FFFFFF",
+            font=(self.sans_family, 9, "bold"), command=top.destroy
+        ).pack(side=tk.LEFT, padx=5)
         top.bind("<Return>", lambda e: save_and_close())
 
     def toggle_sd_record(self):
@@ -864,6 +1015,10 @@ class VirtualScanner(tk.Tk):
         self.after(300, lambda: self.serial_manager.send_cmd(b"KEY,Y,P\r"))
 
     def toggle_usb_record(self):
+        if not self.has_ffmpeg:
+            messagebox.showerror("Missing Dependency", "FFmpeg is not installed. Please install ffmpeg via apt.")
+            return
+
         self.usb_record_enabled = not self.usb_record_enabled
         if self.usb_record_enabled:
             self.usb_rec_btn.config(text="● USB REC", fg="#FF0000")
@@ -878,6 +1033,10 @@ class VirtualScanner(tk.Tk):
                 self.usb_engine = None
 
     def toggle_wifi_record(self):
+        if not self.has_ffmpeg:
+            messagebox.showerror("Missing Dependency", "FFmpeg is not installed. Please install ffmpeg via apt.")
+            return
+
         if not self.scanner_ip:
             self.set_ip()
             if not self.scanner_ip:
@@ -966,6 +1125,12 @@ class VirtualScanner(tk.Tk):
                 self.log_tree.move(tg_key, "", 0)
             else:
                 self.log_tree.insert("", 0, iid=tg_key, values=row_vals, tags=(row_tag,))
+                children = self.log_tree.get_children()
+                if len(children) > MAX_LOG_ROWS:
+                    oldest_key = children[-1]
+                    self.log_tree.delete(oldest_key)
+                    self.tg_hits.pop(oldest_key, None)
+                    self.call_times.pop(oldest_key, None)
         except Exception as e:
             logging.warning("Error writing row to activity log: %s", e)
 
@@ -995,15 +1160,20 @@ class VirtualScanner(tk.Tk):
         self.serial_manager.send_cmd(f"KEY,{key_code},P\r".encode("ascii"))
 
     def send_volume(self):
+        self.vol_dragging = False
+        self.last_vol_change = time.time()
         val = int(self.vol_slider.get())
         self.serial_manager.send_cmd(f"VOL,{val:02d}\r".encode("ascii"))
 
     def send_squelch(self):
+        self.sql_dragging = False
+        self.last_sql_change = time.time()
         val = int(self.sql_slider.get())
         self.serial_manager.send_cmd(f"SQL,{val:02d}\r".encode("ascii"))
 
     def process_serial_queue(self):
         latest_sts = None
+        now = time.time()
 
         while not self.serial_queue.empty():
             try:
@@ -1019,15 +1189,17 @@ class VirtualScanner(tk.Tk):
                     if line.startswith("STS,"):
                         latest_sts = line
                     elif line.startswith("VOL,"):
-                        try:
-                            self.vol_slider.set(int(line.split(",")[1]))
-                        except Exception:
-                            pass
+                        if not self.vol_dragging and (now - self.last_vol_change > 1.0):
+                            try:
+                                self.vol_slider.set(int(line.split(",")[1]))
+                            except Exception:
+                                pass
                     elif line.startswith("SQL,"):
-                        try:
-                            self.sql_slider.set(int(line.split(",")[1]))
-                        except Exception:
-                            pass
+                        if not self.sql_dragging and (now - self.last_sql_change > 1.0):
+                            try:
+                                self.sql_slider.set(int(line.split(",")[1]))
+                            except Exception:
+                                pass
                     elif line.startswith("CLC,"):
                         try:
                             mode = line.split(",")[1].strip()
@@ -1060,16 +1232,16 @@ class VirtualScanner(tk.Tk):
             uid_raw = ""
             tgid_name = ""
 
-            m_uid = re.search(r"UID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", line, re.IGNORECASE)
+            m_uid = UID_REGEX.search(line)
             if m_uid:
                 candidate_uid = m_uid.group(1).strip()
                 if candidate_uid and not is_status_line(candidate_uid):
                     uid_raw = candidate_uid
 
-            m_tgid = re.search(r"TGID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", line, re.IGNORECASE)
+            m_tgid = TGID_REGEX.search(line)
             if m_tgid:
                 raw_t = m_tgid.group(1).strip()
-                nums = re.findall(r"\d+", raw_t)
+                nums = NUM_REGEX.findall(raw_t)
                 tgid_name = nums[-1] if nums else raw_t
 
             fields = [x.strip() for x in line.split(",")]
@@ -1112,7 +1284,7 @@ class VirtualScanner(tk.Tk):
 
                 while idx < len(fields):
                     next_fmt = fields[idx].strip()
-                    is_valid_fmt = next_fmt in ("", "1") or bool(re.fullmatch(r"^[0-9Rr* ]+$", next_fmt))
+                    is_valid_fmt = next_fmt in ("", "1") or bool(FMT_REGEX.fullmatch(next_fmt))
                     if is_valid_fmt:
                         break
                     txt += "," + fields[idx]
@@ -1133,15 +1305,15 @@ class VirtualScanner(tk.Tk):
                     self.lcd_canvas.itemconfig(self.lcd_texts[i], text="")
 
             for t_line in raw_lines:
-                u_match = re.search(r"UID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", t_line, re.IGNORECASE)
+                u_match = UID_REGEX.search(t_line)
                 if u_match:
                     cand = u_match.group(1).strip()
                     if cand and not is_status_line(cand):
                         uid_raw = cand
-                t_match = re.search(r"TGID\s*[:\s]\s*([A-Za-z0-9_\-\. ]+)", t_line, re.IGNORECASE)
+                t_match = TGID_REGEX.search(t_line)
                 if t_match:
                     t_cand = t_match.group(1).strip()
-                    t_nums = re.findall(r"\d+", t_cand)
+                    t_nums = NUM_REGEX.findall(t_cand)
                     tgid_name = t_nums[-1] if t_nums else t_cand
 
             full_text_upper = "\n".join(display_lines).upper()
@@ -1230,13 +1402,4 @@ class VirtualScanner(tk.Tk):
                         self._last_scan_state = "- SCANNING -"
 
             if sig_text != self._last_sig or current_sig_color != self._last_sig_color:
-                self.sig_label.config(text=sig_text, fg=current_sig_color)
-                self._last_sig, self._last_sig_color = sig_text, current_sig_color
-
-        except Exception as e:
-            logging.warning("Error processing display update: %s", e)
-
-
-if __name__ == "__main__":
-    app = VirtualScanner()
-    app.mainloop()
+                self.sig
