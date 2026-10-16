@@ -1402,4 +1402,13 @@ class VirtualScanner(tk.Tk):
                         self._last_scan_state = "- SCANNING -"
 
             if sig_text != self._last_sig or current_sig_color != self._last_sig_color:
-                self.sig
+                self.sig_label.config(text=sig_text, fg=current_sig_color)
+                self._last_sig = sig_text
+                self._last_sig_color = current_sig_color
+        except Exception as e:
+            logging.debug("STS parse error: %s", e)
+
+
+if __name__ == "__main__":
+    app = VirtualScanner()
+    app.mainloop()
