@@ -2,7 +2,7 @@
 """
 LinScan-536 Pro: Computer-Aided Scanning (CAS) suite,
 activity logger, per-call audio recorder, UID alias manager, and web dashboard
-for Uniden BCD536HP / SDS200 digital scanners over USB Serial and Wi-Fi UDP/RTSP.
+for Uniden BCD536HP digital scanner over USB Serial and Wi-Fi UDP/RTSP.
 
 Repository: https://github.com/UPMI-Scanner/LinScan-536
 License: MIT
@@ -822,7 +822,7 @@ class USBRecordingEngine(threading.Thread):
 
 class RTSPAudioEngine(threading.Thread):
     """
-    ProScan-grade Uniden BCD536HP / SDS200 Wi-Fi RTSP audio engine.
+    ProScan-grade Uniden BCD536HP Wi-Fi RTSP audio engine.
     Features:
       - Full RTSP 1.0 response framing & status validation
       - Even/odd RTP/RTCP UDP port pair (UFW-friendly default 50538-50539)

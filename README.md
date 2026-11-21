@@ -1,6 +1,6 @@
 # LinScan-536
 
-A lightweight, native Linux control panel, activity logger, UID alias manager, and USB/Wi-Fi audio recorder for Uniden BCD536HP and SDS200 digital scanners.
+A lightweight, native Linux control panel, activity logger, UID alias manager, and USB/Wi-Fi audio recorder for the Uniden BCD536HP digital scanner.
 
 ![LinScan-536 Dashboard](screenshot.png)
 
