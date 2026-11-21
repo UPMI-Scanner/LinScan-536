@@ -1,49 +1,46 @@
 # LinScan-536
-![LinScan-536 Interface](Screenshot_2026-08-05_20-11-39.png)
 
-A high-performance, lightweight Linux virtual control dashboard and RTSP audio recording suite for the **Uniden BCD536HP** radio scanner.
+A lightweight, native Linux control panel, activity logger, UID alias manager, and USB/Wi-Fi audio recorder for Uniden BCD536HP and SDS200 digital scanners.
 
-![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)
-![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+![LinScan-536 Dashboard](screenshot.png)
 
----
+## What's New
 
-## Key Features
+- **USB-First Control & Live Switching:** Defaults to USB serial (`● USB CTRL`) and switches safely to Wi-Fi UDP (`● WIFI CTRL`) with a live badge (`[USB: ttyACM0]` / `[WIFI: IP]`).
+- **Upgraded Wi-Fi UDP & RTSP Audio:** Built-in `WIFI SETUP` test (`Test Wi-Fi`), UFW-friendly ports (`50538-50539`), clean `TEARDOWN`, auto-reconnect, and a 0.5s pre-roll buffer.
+- **Live Wi-Fi Speaker Monitor (`LISTEN`):** Stream real-time scanner audio over Wi-Fi via `ffplay` with or without recording MP3s.
+- **Persistent SQLite History & 3 Tabs:** Saves logged calls across restarts (`~/.config/linscan/history.db`) across **Summary / Channel Hits**, **Chronological Call History & Audio** (double-click to play, `■ STOP` to halt), and **UID Database & Aliases** (double-click to tag with live cross-tab sync).
+- **Sorting, Live Search & Kerchunk Filter:** Click any column header to sort, type in `FLT:` to filter live, and toggle `MIN2S` to skip calls under 2 seconds.
+- **Interactive LAN Web Server (`WEB`):** View live LCD and history in any browser on your local network with remote keypad controls.
 
-- **Real-Time LCD Display:** Renders exact front-panel scanner text and signal strength meter over USB serial.
-- **Hardware Volume & Squelch Sync:** Queries and automatically mirrors physical volume and squelch knob levels directly on application launch.
-- **Virtual Control Panel:** Full virtual front plate with interactive knob controls, keypad shortcuts, and quick channel option keys.
-- **Physical Keyboard Hotkeys:** Control your scanner directly using standard PC keyboard binds (Numpad 0-9, Space for Channel Hold, Esc for Avoid, etc.).
-- **Deduplicated Activity Table:** Live high-contrast table displaying active talkgroups, timestamps, raw unit IDs (UID), and hit counts.
-- **Double-Click Channel Hold:** Double-click any row in the activity table to instantly hold the scanner on that active channel.
-- **Wi-Fi RTSP Audio Recording:** Native RTSP Wi-Fi audio stream recording with integrated FFmpeg silence removal, noise spike auto-purging, and timestamped file output.
-- **CSV Session Export:** Export live monitoring activity logs to standard .csv spreadsheets with one click.
-- **Universal Linux Support:** Includes automatic udev hardware permission rules so any user on the system can connect without permission errors.
+## Installation (Debian / Ubuntu / Mint / BunsenLabs)
 
----
+Requires `python3`, `python3-tk`, `python3-serial`, and `ffmpeg` (includes `ffplay`).
 
-## Installation
-
-To install LinScan-536 on Debian, Ubuntu, BunsenLabs, or any Debian-based Linux distribution:
-
+```bash
 git clone https://github.com/UPMI-Scanner/LinScan-536.git
-
 cd LinScan-536
-
 ./install.sh
+```
 
----
+Or run directly from the project folder:
 
-## Hardware Connection Guide
+```bash
+python3 linscan_536.py
+```
 
-1. Connect your **Uniden BCD536HP** scanner to your computer using a USB programming cable.
-2. Turn on the scanner. When prompted on the scanner's display, press **. / NO** to select **Serial Port** mode.
-3. Open **LinScan-536** from your application menu.
+## Hardware & Wi-Fi Setup
 
----
+- **USB Serial (Default):** Plug a data-capable Mini-USB cable into the front port of the BCD536HP and press `. / NO` for **Serial Port** mode.
+- **USB Audio Recording (`USB REC`):** Connect a 3.5mm audio cable from the scanner to your PC audio input.
+- **Optional Wi-Fi Control & Audio:** Recommended BC-WF1 firmware is **v7.28**. Click **WIFI SETUP**, enter your scanner IP, and click **Test Wi-Fi**. If using `ufw`, allow your scanner IP:
 
-## License
+```bash
+sudo ufw allow from SCANNER_IP port 50536 proto udp
+sudo ufw allow from SCANNER_IP proto udp to any port 50538:50539
+```
 
-Distributed under the MIT License. Free to use, modify, and share.# LinScan-536
-Lightweight Linux virtual control dashboard and audio recording suite for the Uniden BCD536HP.
+## Disclaimer & License
+
+Independent open-source project; not affiliated with or endorsed by Uniden.
+Distributed under the **MIT License**.

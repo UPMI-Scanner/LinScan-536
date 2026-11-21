@@ -48,7 +48,7 @@ echo -e "  ${GREEN}✓${NC} Cached bytecode removed."
 
 # 5. Validate Python syntax
 echo -e "\n${YELLOW}[4/5] Running Python bytecode compilation check...${NC}"
-python3 -m py_compile linscan_536.py
+python3 -m py_compile linscan_536.py linscan_pro.py
 echo -e "  ${GREEN}✓ linscan_536.py compiled with zero syntax errors.${NC}"
 
 # 6. Apply executable permissions
